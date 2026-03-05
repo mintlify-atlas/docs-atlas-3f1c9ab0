@@ -1,0 +1,112 @@
+{
+  "projectType": "saas",
+  "projectName": "Umbra",
+  "projectDescription": "Confidential AI platform that routes sensitive documents into trusted execution environments for secure processing.",
+  "theme": "aspen",
+  "primaryColor": "#ff6b6b",
+  "lightColor": "#ffa8a8",
+  "darkColor": "#c92a2a",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/confidential-workspace",
+              "features/attestation",
+              "features/authentication",
+              "features/admin-console"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "security/tee-overview",
+              "security/tdx-attestation",
+              "security/ekm-channel-binding",
+              "security/atls"
+            ]
+          },
+          {
+            "group": "Frontend",
+            "pages": [
+              "frontend/overview",
+              "frontend/setup",
+              "frontend/environment-variables",
+              "frontend/testing"
+            ]
+          },
+          {
+            "group": "CVM Services",
+            "pages": [
+              "cvm/overview",
+              "cvm/attestation-service",
+              "cvm/auth-service",
+              "cvm/cert-manager",
+              "cvm/deployment"
+            ]
+          },
+          {
+            "group": "Monitoring",
+            "pages": [
+              "monitoring/overview",
+              "monitoring/setup",
+              "monitoring/dashboards"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Attestation Service",
+            "pages": [
+              "api/attestation/health",
+              "api/attestation/tdx-quote"
+            ]
+          },
+          {
+            "group": "Frontend API Routes",
+            "pages": [
+              "api/frontend/waitlist",
+              "api/frontend/feedback",
+              "api/frontend/form-token",
+              "api/frontend/chat-completions"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Intel TDX attestation with DCAP verification",
+    "RA-TLS (Remote Attestation TLS) for cryptographically verified connections",
+    "EKM channel binding with HMAC-SHA256 for TLS security",
+    "Next.js frontend with streaming chat interface",
+    "Confidential Virtual Machine services on Phala Cloud",
+    "PDF document processing in trusted execution environment",
+    "Supabase authentication with role-based access control",
+    "Prometheus + Grafana monitoring for vLLM metrics"
+  ],
+  "publicApiSurface": [
+    "GET /health - Attestation service health check",
+    "POST /tdx_quote - Generate TDX attestation quote",
+    "POST /api/waitlist - Submit waitlist request",
+    "POST /api/feedback - Submit user feedback",
+    "GET /api/form-token - Generate HMAC-signed form token",
+    "POST /api/chat/completions - Proxy OpenAI-compatible streaming requests",
+    "GET /api/admin/waitlist - List waitlist requests (admin)",
+    "POST /api/admin/waitlist/[id]/activate - Activate waitlist user (admin)"
+  ]
+}
