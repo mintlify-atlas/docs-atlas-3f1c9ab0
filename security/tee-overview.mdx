@@ -1,0 +1,193 @@
+---
+title: Trusted Execution Environments
+description: Overview of TEEs and confidential computing for AI workloads
+---
+
+## What is a Trusted Execution Environment?
+
+A **Trusted Execution Environment (TEE)** is a secure area of a processor that guarantees code and data loaded inside it are protected with respect to confidentiality and integrity. TEEs provide hardware-level isolation that ensures even privileged software (like the operating system or hypervisor) cannot access or tamper with the protected workload.
+
+### Key Properties
+
+TEEs provide three fundamental security guarantees:
+
+1. **Confidentiality**: Data processed inside the TEE is encrypted and inaccessible to external observers
+2. **Integrity**: Code execution cannot be tampered with or modified by unauthorized parties
+3. **Attestation**: Remote parties can cryptographically verify what code is running inside the TEE
+
+## Confidential Computing Principles
+
+Confidential computing extends traditional security models by protecting data **during computation**, not just at rest or in transit:
+
+```
+Traditional Security:
+├── Data at Rest (encrypted)
+├── Data in Transit (TLS)
+└── Data in Use (plaintext in memory) ← vulnerable
+
+Confidential Computing:
+├── Data at Rest (encrypted)
+├── Data in Transit (TLS)
+└── Data in Use (encrypted + isolated) ← protected by TEE
+```
+
+### Hardware-Based Security
+
+Unlike software-based isolation, TEEs leverage hardware features to enforce security boundaries:
+
+- **Memory Encryption**: All TEE memory is encrypted with processor-managed keys
+- **Attestation Quotes**: Hardware-signed evidence of the TEE's state
+- **Secure Key Provisioning**: Keys derived from hardware root of trust
+- **Side-Channel Resistance**: Protection against timing and cache attacks
+
+<Note>
+TEE security does not depend on trusting the cloud provider, operating system, or virtualization layer.
+</Note>
+
+## Phala Cloud CVM Deployment
+
+Umbra runs on **Phala Cloud** using **Confidential Virtual Machines (CVMs)** powered by Intel TDX (Trust Domain Extensions). The deployment architecture consists of:
+
+### Service Components
+
+```yaml
+services:
+  vllm:           # LLM inference engine
+  nginx:          # TLS termination + EKM extraction
+  attestation:    # TDX quote generation
+  auth:           # Token validation
+  cert-manager:   # Let's Encrypt + certificate management
+```
+
+All services run **inside the same TDX trust domain**, which means:
+
+- Services can communicate over localhost without leaving the TEE
+- Network traffic entering/exiting the TEE is protected by TLS with EKM channel binding
+- The entire stack is measured and verifiable through attestation
+
+### Security Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Client (Browser)                                        │
+│  ├── aTLS WASM Client                                   │
+│  ├── DCAP Verification (local)                          │
+│  └── TLS 1.3 Connection                                 │
+└───────────────────┬─────────────────────────────────────┘
+                    │ Attestation Quote + TLS
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│ Phala Cloud CVM (Intel TDX)                             │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Nginx (TLS termination + EKM extraction)            │ │
+│ │   ├── Extracts EKM from TLS session                 │ │
+│ │   └── Forwards with HMAC signature                  │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Attestation Service                                 │ │
+│ │   ├── Validates EKM HMAC                            │ │
+│ │   ├── Computes report_data = SHA512(nonce + EKM)   │ │
+│ │   └── Generates TDX quote via dstack                │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ vLLM (AI Model Inference)                           │ │
+│ │   └── Processes sensitive prompts + documents       │ │
+│ └─────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+         Hardware-enforced isolation and encryption
+```
+
+<Warning>
+The operator deploying the CVM never sees HMAC keys or TLS session keys. All secrets are derived inside the TEE using dstack's deterministic key derivation.
+</Warning>
+
+## Why TEEs for AI Workloads
+
+AI inference on sensitive data presents unique security challenges:
+
+### 1. **Data Confidentiality**
+
+AI models process highly sensitive inputs:
+- Medical records
+- Financial documents
+- Legal contracts
+- Personal communications
+
+TEEs ensure these inputs remain encrypted in memory during processing, protecting against:
+- Cloud provider access
+- Co-tenant attacks
+- Compromised hypervisors
+- Memory dumps and forensics
+
+### 2. **Model Protection**
+
+Proprietary AI models are valuable intellectual property. TEEs can protect:
+- Model weights and architectures
+- Fine-tuning data
+- Inference optimizations
+
+### 3. **Regulatory Compliance**
+
+Many regulations require demonstrable security controls:
+- **HIPAA**: Protected Health Information (PHI) must be encrypted during processing
+- **GDPR**: Data processing requires appropriate technical measures
+- **CCPA**: Consumer data must be secured against unauthorized access
+
+TEE attestation provides cryptographic proof of compliance.
+
+### 4. **Zero-Trust Architecture**
+
+Traditional cloud deployments require trusting the provider. TEEs enable:
+- **Client-side verification**: Users verify the TEE state before sending data
+- **No server trust**: Provider cannot access data even with root access
+- **Verifiable code**: Attestation proves exactly what code is running
+
+### 5. **Multi-Party Computation**
+
+TEEs enable scenarios where multiple parties need to collaborate without trusting each other:
+- Combining datasets from competing organizations
+- Regulatory auditing without exposing raw data
+- Privacy-preserving analytics
+
+## Security Limitations
+
+While TEEs provide strong security guarantees, they have limitations:
+
+<Warning>
+**What TEEs DO NOT protect against:**
+- Side-channel attacks (though mitigations exist)
+- Vulnerabilities in the TEE code itself
+- Physical access attacks (requires specialized equipment)
+- Denial of service attacks
+- Compromised client endpoints
+</Warning>
+
+## Verification Process
+
+Umbra implements a complete attestation flow:
+
+1. **Client initiates connection**: Browser connects via aTLS proxy
+2. **TLS handshake**: Client and TEE establish encrypted channel
+3. **Quote generation**: Attestation service generates TDX quote with nonce + EKM
+4. **Client-side verification**: Browser verifies quote using Intel DCAP
+5. **Policy validation**: Client checks measurements against expected values
+6. **Trusted communication**: If verification succeeds, client sends sensitive data
+
+See [Intel TDX Attestation](/security/tdx-attestation) for detailed verification steps.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="TDX Attestation" icon="shield-check" href="/security/tdx-attestation">
+    Deep dive into Intel TDX quotes and DCAP verification
+  </Card>
+  <Card title="EKM Channel Binding" icon="link" href="/security/ekm-channel-binding">
+    Learn how TLS sessions are cryptographically bound to attestations
+  </Card>
+  <Card title="RA-TLS (aTLS)" icon="lock" href="/security/atls">
+    Explore the Remote Attestation TLS implementation
+  </Card>
+  <Card title="Deployment Guide" icon="rocket" href="/deployment/cvm-setup">
+    Deploy your own TEE-backed AI service
+  </Card>
+</CardGroup>

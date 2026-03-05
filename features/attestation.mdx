@@ -1,0 +1,437 @@
+---
+title: "Attestation System"
+description: "Intel TDX attestation with DCAP verification and EKM channel binding"
+---
+
+Umbra's attestation system provides cryptographic proof that AI workloads are running inside genuine Intel Trust Domain Extensions (TDX) trusted execution environments.
+
+## Overview
+
+The attestation service is a FastAPI application (`cvm/attestation-service/attestation_service.py`) that exposes REST endpoints for generating TDX attestation quotes. It communicates with the dstack daemon via Unix socket (`/var/run/dstack.sock`) to access TDX hardware.
+
+<Note>
+  Attestation verification happens **entirely in the browser** using Intel's DCAP QVL library compiled to WebAssembly. The server only generates quotes—it never performs verification, ensuring zero server trust.
+</Note>
+
+## TDX Attestation Overview
+
+Intel Trust Domain Extensions (TDX) isolate virtual machines using hardware-enforced encryption and integrity protection. Attestation proves:
+
+1. **Code identity** - Exact measurements of firmware, OS, and application
+2. **Hardware protection** - Running inside genuine Intel TDX silicon
+3. **Platform security** - TCB (Trusted Computing Base) status
+4. **Fresh proof** - Cryptographic binding to current TLS session
+
+### Attestation Quote Structure
+
+TDX quotes contain:
+
+- **MRTD** - Measurement of the initial Trust Domain
+- **RTMR0** - Runtime measurement register 0 (firmware)
+- **RTMR1** - Runtime measurement register 1 (OS/kernel)
+- **RTMR2** - Runtime measurement register 2 (application)
+- **Report Data** - 64 bytes of custom data (nonce + EKM for channel binding)
+- **TCB Status** - Trusted Computing Base security level
+
+<Warning>
+  Attestation quotes are cryptographically bound to specific TLS sessions using Exported Keying Material (EKM). Quotes cannot be replayed across different connections.
+</Warning>
+
+## Intel DCAP Verification
+
+Umbra uses Intel's Data Center Attestation Primitives (DCAP) for quote verification:
+
+### Verification Steps
+
+<Steps>
+  <Step title="Quote Extraction">
+    Extract TDX quote from attestation response and parse the quote structure.
+  </Step>
+  
+  <Step title="Signature Verification">
+    Verify quote signature using Intel's Quoting Enclave (QE) certificate chain.
+  </Step>
+  
+  <Step title="TCB Verification">
+    Check TCB status against Intel's Provisioning Certification Service (PCS) to ensure platform security.
+  </Step>
+  
+  <Step title="Measurement Verification">
+    Compare MRTD and RTMR values against expected policy measurements.
+  </Step>
+  
+  <Step title="Report Data Verification">
+    Verify report data contains expected nonce and EKM binding.
+  </Step>
+</Steps>
+
+### TCB Status Values
+
+| Status | Meaning |
+|--------|--------|
+| `UpToDate` | Platform is fully patched and trusted |
+| `SWHardeningNeeded` | Minor software hardening recommended |
+| `ConfigurationNeeded` | Platform configuration required |
+| `OutOfDate` | Platform has known vulnerabilities |
+| `Revoked` | Platform trust has been revoked |
+
+<Note>
+  Umbra accepts `UpToDate` and `SWHardeningNeeded` by default. Stricter policies can be enforced by updating the attestation policy configuration.
+</Note>
+
+## Quote Generation Process
+
+The attestation service exposes a `/tdx_quote` endpoint that generates quotes with custom report data.
+
+### Endpoint: POST /tdx_quote
+
+**Request:**
+
+```json
+{
+  "nonce_hex": "0123456789abcdef..." // 64-char hex string (32 bytes)
+}
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "quote": {
+    "quote": "base64-encoded-tdx-quote",
+    "collateral": { ... }
+  },
+  "tcb_info": {
+    "version": "3.0",
+    "tcb_level": { ... }
+  },
+  "timestamp": "1234567890",
+  "quote_type": "tdx"
+}
+```
+
+### Implementation
+
+The service uses the `dstack_sdk` to interact with TDX hardware:
+
+```python:cvm/attestation-service/attestation_service.py
+@app.post("/tdx_quote", response_model=QuoteResponse)
+async def post_tdx_quote(request: Request, data: QuoteRequest):
+    """
+    Get TDX quote with report data.
+    """
+    logger.info("TDX quote with report data requested")
+
+    # Extract and validate EKM header
+    ekm_header = request.headers.get(HEADER_TLS_EKM_CHANNEL_BINDING)
+    if not ekm_header:
+        raise HTTPException(status_code=400, detail="Missing EKM header")
+
+    try:
+        ekm_hex = validate_and_extract_ekm(ekm_header, EKM_SHARED_SECRET)
+    except ValueError as e:
+        logger.error(f"EKM validation failed: {e}")
+        raise HTTPException(status_code=403, detail="Invalid EKM header signature")
+
+    # Compute report data from nonce + EKM
+    report_data = compute_report_data(data.nonce_hex, ekm_hex)
+
+    # Get quote from dstack
+    if dstack_client is None:
+        raise HTTPException(status_code=500, detail="Server not ready")
+
+    try:
+        quote, info_response = await asyncio.gather(
+            dstack_client.get_quote(report_data),
+            dstack_client.info()
+        )
+        tcb_info = info_response.tcb_info
+        logger.info("Successfully obtained TDX quote")
+    except Exception as e:
+        logger.exception(f"Error obtaining TDX quote: {e}")
+        raise HTTPException(status_code=500, detail="Failed to obtain TDX quote")
+
+    return QuoteResponse(
+        success=True,
+        quote=quote,
+        tcb_info=tcb_info,
+        timestamp=str(int(time.time())),
+        quote_type="tdx",
+    )
+```
+
+### Report Data Computation
+
+Report data binds attestation to the TLS session:
+
+```python:cvm/attestation-service/attestation_service.py
+def compute_report_data(nonce_hex: str, ekm_hex: str) -> bytes:
+    """
+    Compute report_data from nonce and EKM using SHA512.
+
+    This implements TLS channel binding for attestation.
+    The nonce provides freshness and the EKM binds to the specific TLS session.
+    Clients will verify that the same nonce and EKM were used.
+
+    Args:
+        nonce_hex: 64-character hex string (32 bytes)
+        ekm_hex: 64-character hex string (32 bytes)
+
+    Returns:
+        64-byte SHA512 hash suitable for TDX report_data
+    """
+    if len(nonce_hex) != 64:
+        raise ValueError("nonce_hex must be exactly 64 hex characters (32 bytes)")
+    if len(ekm_hex) != 64:
+        raise ValueError("ekm_hex must be exactly 64 hex characters (32 bytes)")
+    nonce = bytes.fromhex(nonce_hex)
+    ekm = bytes.fromhex(ekm_hex)
+    return hashlib.sha512(nonce + ekm).digest()
+```
+
+## EKM Channel Binding Integration
+
+Exported Keying Material (EKM) provides TLS channel binding as defined in [RFC 9266](https://datatracker.ietf.org/doc/rfc9266/).
+
+### Architecture
+
+The attestation service **does not handle TLS directly**. Instead:
+
+<Steps>
+  <Step title="TLS Termination">
+    Nginx (cert-manager) terminates TLS connections from clients and extracts EKM from the connection.
+  </Step>
+  
+  <Step title="HMAC Signing">
+    Nginx computes `HMAC-SHA256(ekm_raw, hmac_key)` and forwards as header: `{ekm_hex}:{hmac_hex}`.
+  </Step>
+  
+  <Step title="HMAC Validation">
+    Attestation service validates HMAC before trusting EKM, preventing header forgery.
+  </Step>
+  
+  <Step title="Report Data Binding">
+    EKM is included in report data computation, binding attestation to the TLS session.
+  </Step>
+</Steps>
+
+### HMAC Key Derivation
+
+The HMAC key is **derived inside the TEE** at startup:
+
+```python:cvm/attestation-service/attestation_service.py
+def _get_ekm_hmac_secret() -> str:
+    """Derive EKM HMAC key from TEE, falling back to env var for dev/test."""
+    try:
+        from dstack_sdk import DstackClient
+        client = DstackClient()
+        derived = client.get_key("ekm/hmac-key/v1").decode_key().hex()
+        logger.info("EKM HMAC key derived from TEE (dstack)")
+        return derived
+    except Exception as e:
+        logger.warning(f"dstack key derivation failed ({e}), falling back to EKM_SHARED_SECRET")
+        env_secret = os.getenv("EKM_SHARED_SECRET")
+        if not env_secret:
+            raise RuntimeError("EKM_SHARED_SECRET not set")
+        if len(env_secret) < 32:
+            raise RuntimeError("EKM_SHARED_SECRET is too short")
+        logger.info("EKM validation enabled with shared secret")
+        return env_secret
+
+EKM_SHARED_SECRET = _get_ekm_hmac_secret()
+```
+
+### Security Properties
+
+<CardGroup cols={2}>
+  <Card title="Deterministic Derivation" icon="key">
+    Same compose hash + key path = same key. Both nginx and attestation service derive identical keys without external secret injection.
+  </Card>
+  
+  <Card title="TEE-Bound Key" icon="lock">
+    Key never leaves the CVM. The operator who deploys the system never sees the HMAC key.
+  </Card>
+  
+  <Card title="Constant-Time Validation" icon="shield">
+    HMAC validation uses `secrets.compare_digest()` to prevent timing attacks.
+  </Card>
+  
+  <Card title="Defense in Depth" icon="layers">
+    Network isolation (proxy and service in same TEE) + HMAC validation provide multiple security layers.
+  </Card>
+</CardGroup>
+
+### Header Validation
+
+EKM headers are validated before trusting their contents:
+
+```python:cvm/attestation-service/attestation_service.py
+def validate_and_extract_ekm(signed_header: str, secret: str) -> str:
+    """
+    Validate HMAC signature and extract EKM value.
+
+    Args:
+        signed_header: Format "{ekm_hex}:{hmac_hex}" (129 chars)
+        secret: Shared secret for HMAC validation
+
+    Returns:
+        ekm_hex: The validated EKM value (64 hex chars)
+
+    Raises:
+        ValueError: If validation fails
+    """
+    if len(signed_header) != 129 or signed_header[64] != ":":
+        raise ValueError("Invalid EKM header format (expected: {ekm}:{hmac})")
+
+    ekm_hex = signed_header[:64]
+    ekm_raw = bytes.fromhex(ekm_hex)
+    received_hmac = signed_header[65:]
+
+    # Compute expected HMAC
+    expected_hmac = hmac.new(secret.encode("utf-8"), ekm_raw, hashlib.sha256).hexdigest()
+
+    # Constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(received_hmac, expected_hmac):
+        raise ValueError("HMAC validation failed")
+
+    return ekm_hex
+```
+
+## API Endpoints
+
+### Health Check
+
+**Endpoint:** `GET /health`
+
+```bash
+curl https://attestation.example.com/health
+```
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "service": "attestation-service"
+}
+```
+
+### Generate TDX Quote
+
+**Endpoint:** `POST /tdx_quote`
+
+**Headers:**
+- `Content-Type: application/json`
+- `X-TLS-EKM-Channel-Binding: {ekm_hex}:{hmac_hex}` (forwarded by nginx)
+
+**Request Body:**
+```json
+{
+  "nonce_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "quote": {
+    "quote": "AgABAG8VAAA...",
+    "collateral": {
+      "pck_crl_issuer_chain": "...",
+      "root_ca_crl": "...",
+      "pck_crl": "...",
+      "tcb_info_issuer_chain": "...",
+      "tcb_info": "...",
+      "qe_identity_issuer_chain": "...",
+      "qe_identity": "..."
+    }
+  },
+  "tcb_info": {
+    "version": "3.0",
+    "tcb_level": {
+      "sgx_tcb_comp_01_svn": 3,
+      "sgx_tcb_comp_02_svn": 3,
+      "tdx_tcb_comp_01_svn": 2,
+      "tdx_tcb_comp_02_svn": 0,
+      "pce_svn": 13
+    },
+    "tdx_module_identity": {
+      "id": "TDX_1.5",
+      "mrsigner": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "timestamp": "1704067200",
+  "quote_type": "tdx"
+}
+```
+
+### API Documentation
+
+Interactive API documentation is available at:
+- Swagger UI: `https://attestation.example.com/docs`
+- ReDoc: `https://attestation.example.com/redoc`
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `EKM_SHARED_SECRET` | Yes (dev/test) | HMAC key for EKM validation (only when dstack unavailable) |
+| `NO_TDX` | No | Set to `false` for production TDX mode (default: `true`) |
+
+### Dstack Socket
+
+Production deployments bind to `/var/run/dstack.sock` for TDX hardware access:
+
+```yaml:cvm/docker-compose.yml
+services:
+  attestation-service:
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      - NO_TDX=false
+```
+
+<Warning>
+  Development mode (`NO_TDX=true`) skips dstack socket binding. Attestation endpoints will return errors without TDX hardware access.
+</Warning>
+
+## Testing
+
+The attestation service includes a debug script for testing:
+
+### Debug Endpoints
+
+**Script:** `attestation_service_with_debug.py`
+
+```bash
+# Development mode with debug endpoints
+uv run fastapi run attestation_service_with_debug.py --port 8080 --reload
+```
+
+**Debug endpoint:** `GET /debug/ekm`
+
+Verifies EKM header forwarding and HMAC validation:
+
+```bash
+curl -H "X-TLS-EKM-Channel-Binding: {ekm_hex}:{hmac_hex}" \
+     https://attestation.example.com/debug/ekm
+```
+
+<Warning>
+  Debug endpoints should **never** be used in production. They expose internal state for testing purposes only.
+</Warning>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Confidential Workspace" href="/features/confidential-workspace" icon="lock">
+    Learn how the workspace uses attestation for secure connections
+  </Card>
+  
+  <Card title="aTLS Architecture" href="/architecture/atls" icon="diagram-project">
+    Deep dive into Attested TLS implementation
+  </Card>
+</CardGroup>

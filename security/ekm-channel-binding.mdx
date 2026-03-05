@@ -1,0 +1,405 @@
+---
+title: EKM Channel Binding
+description: RFC 9266 Exported Keying Material with HMAC-SHA256 for TLS session security
+---
+
+## Overview
+
+**Exported Keying Material (EKM)** channel binding cryptographically links TLS connections to application-layer attestations, preventing man-in-the-middle attacks and quote replay attacks.
+
+Umbra implements EKM according to [RFC 9266](https://datatracker.ietf.org/doc/rfc9266/) with an additional HMAC signature layer for defense-in-depth.
+
+## The Problem: Quote Replay Attacks
+
+Without channel binding, an attacker could:
+
+1. Intercept a valid TDX quote from a legitimate TEE
+2. Set up a malicious server
+3. Replay the stolen quote to clients
+4. Client believes it's talking to the TEE, but it's actually talking to the attacker
+
+**Solution**: Bind the attestation quote to the specific TLS session using EKM.
+
+## RFC 9266 EKM Specification
+
+### What is EKM?
+
+EKM is a mechanism defined in TLS 1.3 (RFC 8446) that allows applications to derive additional key material from the TLS master secret:
+
+```
+EKM = TLS-Exporter(label, context, length)
+
+where:
+  label   = "EXPORTER-Channel-Binding" (application-specific)
+  context = empty or application data
+  length  = 32 bytes (for SHA256)
+```
+
+Key properties:
+- **Session-specific**: Different for every TLS connection
+- **Unguessable**: Derived from TLS master secret
+- **Extractable by both peers**: Both client and server can compute the same EKM
+- **Cannot be forged**: Requires knowledge of the TLS session keys
+
+### How Nginx Extracts EKM
+
+Umbra's nginx (cert-manager) is configured with a custom module that extracts EKM from the TLS connection:
+
+```nginx
+location /tdx_quote {
+    # Extract EKM from TLS session
+    set $ekm $ssl_client_exportkeyingmaterial;
+    
+    # Compute HMAC signature
+    set $ekm_hmac hmac_sha256($ekm_shared_secret, $ekm);
+    
+    # Forward to attestation service
+    proxy_set_header X-TLS-EKM-Channel-Binding "$ekm:$ekm_hmac";
+    proxy_pass http://attestation-service:8080;
+}
+```
+
+<Note>
+The actual nginx configuration uses Lua scripting to compute HMAC. The above is simplified for clarity.
+</Note>
+
+## HMAC-SHA256 Signature Layer
+
+### Why HMAC on Top of TLS?
+
+Even though nginx and the attestation service run **inside the same TEE**, we add HMAC signatures for defense-in-depth:
+
+1. **Bypass Protection**: If an attacker somehow bypasses nginx (e.g., container escape), they cannot forge EKM headers
+2. **Network Isolation**: If network isolation fails, HMAC prevents header injection
+3. **Audit Trail**: Logs can detect forged headers
+4. **Zero Trust**: Assume every component might be compromised
+
+### Header Format
+
+The `X-TLS-EKM-Channel-Binding` header uses the format:
+
+```
+{ekm_hex}:{hmac_hex}
+
+where:
+  ekm_hex  = 64 hex characters (32 bytes)
+  hmac_hex = 64 hex characters (32 bytes)
+  total    = 129 characters
+
+Example:
+7a3f9b2e1c8d6f4a0b9e7c5d3a1f8e6c4b2d0f8e6a4c2b0d8f6e4c2a0f8e6c4b:2e8f9c3a7b1d5e0f6c4a8b2d0e6f8c4a2b0d8e6f4c2a0b8e6d4f2c0a8b6e4f2c
+```
+
+### HMAC Computation
+
+The HMAC is computed as:
+
+```python
+import hmac
+import hashlib
+
+def sign_ekm(ekm_hex: str, secret: str) -> str:
+    """Sign EKM with HMAC-SHA256."""
+    ekm_raw = bytes.fromhex(ekm_hex)
+    hmac_obj = hmac.new(secret.encode('utf-8'), ekm_raw, hashlib.sha256)
+    return hmac_obj.hexdigest()
+
+# Example
+ekm_hex = "7a3f9b2e1c8d6f4a0b9e7c5d3a1f8e6c4b2d0f8e6a4c2b0d8f6e4c2a0f8e6c4b"
+secret = "shared-secret-derived-from-dstack"
+hmac_hex = sign_ekm(ekm_hex, secret)
+
+header_value = f"{ekm_hex}:{hmac_hex}"
+```
+
+## Key Derivation from Dstack
+
+The HMAC key is **never configured manually**. Instead, it's derived deterministically inside the TEE:
+
+```python
+from dstack_sdk import DstackClient
+
+def _get_ekm_hmac_secret() -> str:
+    """Derive EKM HMAC key from TEE, falling back to env var for dev/test."""
+    try:
+        client = DstackClient()
+        derived = client.get_key("ekm/hmac-key/v1").decode_key().hex()
+        logger.info("EKM HMAC key derived from TEE (dstack)")
+        return derived
+    except Exception as e:
+        logger.warning(
+            f"dstack key derivation failed ({e}), falling back to EKM_SHARED_SECRET env var"
+        )
+        env_secret = os.getenv("EKM_SHARED_SECRET")
+        if not env_secret:
+            raise RuntimeError("EKM_SHARED_SECRET not set")
+        if len(env_secret) < 32:
+            raise RuntimeError("EKM_SHARED_SECRET is too short")
+        logger.info("EKM validation enabled with shared secret")
+        return env_secret
+```
+
+### Key Derivation Properties
+
+- **Deterministic**: `get_key("ekm/hmac-key/v1")` always returns the same key for the same TEE
+- **Derived from TEE identity**: Key is based on RTMR2 (docker-compose hash) and bootchain
+- **Operator-invisible**: The key never appears in logs, environment variables, or configuration files
+- **Synchronized automatically**: Both nginx and attestation service derive the same key
+
+<Warning>
+**Security Guarantee**: The operator who deploys the CVM never sees the HMAC key. This enables zero-trust deployment where even the person running the infrastructure cannot compromise the system.
+</Warning>
+
+## Validation Code
+
+The attestation service validates EKM headers before trusting them:
+
+```python
+import hmac
+import hashlib
+import secrets
+
+def validate_and_extract_ekm(signed_header: str, secret: str) -> str:
+    """
+    Validate HMAC signature and extract EKM value.
+
+    Args:
+        signed_header: Format "{ekm_hex}:{hmac_hex}" (129 chars)
+        secret: Shared secret for HMAC validation
+
+    Returns:
+        ekm_hex: The validated EKM value (64 hex chars)
+
+    Raises:
+        ValueError: If validation fails
+    """
+    # Validate format
+    if len(signed_header) != 129 or signed_header[64] != ":":
+        raise ValueError("Invalid EKM header format (expected: {ekm}:{hmac})")
+
+    # Extract components
+    ekm_hex = signed_header[:64]
+    ekm_raw = bytes.fromhex(ekm_hex)
+    received_hmac = signed_header[65:]
+
+    # Compute expected HMAC
+    expected_hmac = hmac.new(secret.encode("utf-8"), ekm_raw, hashlib.sha256).hexdigest()
+
+    # Constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(received_hmac, expected_hmac):
+        raise ValueError("HMAC validation failed")
+
+    return ekm_hex
+```
+
+<Note>
+**Timing Attack Protection**: The code uses `secrets.compare_digest()` for constant-time comparison. This prevents attackers from learning information about the HMAC key through timing analysis.
+</Note>
+
+## Complete Flow
+
+Here's the full EKM channel binding flow:
+
+```
+1. Client initiates TLS 1.3 connection to nginx
+   ├── Client Hello
+   ├── Server Hello
+   ├── Key Exchange
+   └── TLS master secret established
+
+2. Nginx extracts EKM from TLS connection
+   ├── ekm_raw = TLS-Exporter("EXPORTER-Channel-Binding", "", 32)
+   ├── ekm_hex = hex(ekm_raw)
+   └── Store for later use
+
+3. Client sends POST /tdx_quote with nonce
+   ├── Request body: {"nonce_hex": "abc123..."}
+   └── Client also computes ekm_client from its TLS session
+
+4. Nginx forwards request to attestation service
+   ├── Derive HMAC key: key = dstack.get_key("ekm/hmac-key/v1")
+   ├── Compute HMAC: hmac = HMAC-SHA256(key, ekm_raw)
+   ├── Add header: X-TLS-EKM-Channel-Binding: {ekm_hex}:{hmac}
+   └── proxy_pass to attestation-service:8080
+
+5. Attestation service validates EKM header
+   ├── Extract signed_header from request
+   ├── Parse ekm_hex and received_hmac
+   ├── Derive key from dstack (same key as nginx)
+   ├── Compute expected_hmac = HMAC-SHA256(key, ekm_raw)
+   ├── secrets.compare_digest(received_hmac, expected_hmac)
+   └── If valid, extract ekm_hex; else return 403 Forbidden
+
+6. Attestation service computes report_data
+   ├── report_data = SHA512(nonce || ekm_raw)
+   └── This binds the quote to BOTH the client nonce AND the TLS session
+
+7. Attestation service generates TDX quote
+   ├── dstack_client.get_quote(report_data)
+   └── Quote includes report_data in signed body
+
+8. Client receives quote and verifies
+   ├── Verify quote signature (DCAP)
+   ├── Extract report_data from quote
+   ├── Recompute expected = SHA512(nonce || ekm_client)
+   ├── if report_data == expected: SUCCESS
+   └── else: REJECT (quote not bound to this TLS session)
+```
+
+## Security Properties
+
+### What EKM Channel Binding Provides
+
+✅ **Session Binding**: Quote is cryptographically bound to the specific TLS connection
+
+✅ **Replay Prevention**: Attacker cannot reuse a quote on a different TLS session
+
+✅ **MITM Detection**: If attacker terminates TLS and re-establishes it, EKM will differ
+
+✅ **Freshness**: Combined with client nonce, proves quote was generated for THIS request
+
+### Defense Layers
+
+Umbra's EKM implementation has multiple security layers:
+
+1. **TLS 1.3 Encryption**: EKM derived from TLS master secret
+2. **TEE Isolation**: Nginx and attestation service run in same TEE
+3. **HMAC Signature**: Prevents header forgery even if network isolation fails
+4. **Constant-Time Validation**: Prevents timing attacks
+5. **Key Derivation**: HMAC key derived from TEE identity, never exposed
+6. **Client-Side Verification**: Client independently verifies EKM in report_data
+
+<Warning>
+**Critical**: All six layers must be intact for full security. Disabling any layer (e.g., using `NO_TDX=true` or skipping HMAC validation) significantly weakens security.
+</Warning>
+
+## Development Mode
+
+For local testing without dstack:
+
+```bash
+# Set shared secret manually
+export EKM_SHARED_SECRET=$(openssl rand -hex 32)
+
+# Both nginx and attestation service must use the same value
+echo "EKM_SHARED_SECRET=$EKM_SHARED_SECRET" >> .env
+
+# Start services
+cd cvm
+make dev-up
+```
+
+<Warning>
+**Never use the same `EKM_SHARED_SECRET` across multiple deployments.** Each deployment should derive a unique key from its TEE measurements.
+</Warning>
+
+## Troubleshooting
+
+### 403 Forbidden: Invalid EKM header signature
+
+```
+Error: EKM validation failed
+```
+
+**Causes:**
+- Nginx and attestation service using different HMAC keys
+- `EKM_SHARED_SECRET` mismatch in development mode
+- dstack key derivation failing on one service but not the other
+- Header corruption (check nginx buffer sizes)
+
+**Solution:**
+```bash
+# Check both services are using the same key derivation
+cd cvm/attestation-service
+make logs | grep "EKM HMAC key derived"
+
+cd ../cert-manager
+make logs | grep "EKM HMAC key derived"
+```
+
+### 400 Bad Request: Missing EKM header
+
+```
+Error: Missing EKM header
+```
+
+**Causes:**
+- Nginx not configured to extract EKM
+- TLS connection terminated outside nginx (e.g., load balancer)
+- Client using HTTP instead of HTTPS
+- Request bypassing nginx (direct access to attestation service)
+
+**Solution:** Ensure all requests go through nginx with TLS termination inside the TEE.
+
+### Report Data Mismatch
+
+```
+Error: report_data does not match expected SHA512(nonce || EKM)
+```
+
+**This is a critical security error.** Causes:
+- EKM extraction failed (nginx forwarded wrong value)
+- Client computed EKM incorrectly
+- MITM attack (TLS terminated outside TEE)
+- Quote replay attack
+
+<Warning>
+**Do NOT ignore this error.** It indicates a potential attack or serious misconfiguration.
+</Warning>
+
+## Testing EKM Validation
+
+The attestation service includes a debug endpoint for testing:
+
+```bash
+# Start with debug endpoints (dev only)
+cd cvm/attestation-service
+uv run fastapi run attestation_service_with_debug.py --port 8080 --reload
+
+# Test EKM header validation
+curl -X GET http://localhost:8080/debug/ekm \
+  -H "X-TLS-EKM-Channel-Binding: $(generate_signed_ekm.py)"
+
+# Should return:
+{
+  "ekm_hex": "7a3f9b2e...",
+  "hmac_valid": true,
+  "hmac_algorithm": "HMAC-SHA256"
+}
+```
+
+<Warning>
+**Never enable debug endpoints in production.** They expose sensitive internals and bypass security checks.
+</Warning>
+
+## Implementation Checklist
+
+When implementing EKM channel binding:
+
+- [ ] Configure nginx to extract EKM from TLS connections
+- [ ] Ensure nginx and attestation service derive HMAC key from same dstack path
+- [ ] Validate header format (129 characters, colon at position 64)
+- [ ] Use constant-time comparison (`secrets.compare_digest`)
+- [ ] Include EKM in report_data: `SHA512(nonce || EKM)`
+- [ ] Client verifies report_data matches its own EKM computation
+- [ ] Log HMAC validation failures for security monitoring
+- [ ] Never log the actual HMAC key or EKM values
+- [ ] Test with invalid HMAC signatures to ensure rejection
+- [ ] Verify key derivation works in production environment
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="TDX Attestation" icon="shield-check" href="/security/tdx-attestation">
+    See how EKM is included in TDX quotes
+  </Card>
+  <Card title="RA-TLS (aTLS)" icon="lock" href="/security/atls">
+    Explore the complete aTLS implementation
+  </Card>
+  <Card title="Attestation Service" icon="code" href="https://github.com/concrete-security/umbra/tree/main/cvm/attestation-service">
+    View the validation code
+  </Card>
+  <Card title="RFC 9266" icon="book" href="https://datatracker.ietf.org/doc/rfc9266/">
+    Read the EKM specification
+  </Card>
+</CardGroup>

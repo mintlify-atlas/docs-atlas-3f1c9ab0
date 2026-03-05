@@ -1,0 +1,363 @@
+---
+title: Intel TDX Attestation
+description: Deep dive into Intel TDX quotes, DCAP verification, and TCB status interpretation
+---
+
+## Intel TDX Overview
+
+**Intel Trust Domain Extensions (TDX)** is a confidential computing technology that creates isolated virtual machine environments called Trust Domains (TDs). TDX provides hardware-enforced memory encryption and integrity protection for entire VMs.
+
+### Key TDX Components
+
+- **Trust Domain (TD)**: An isolated VM with encrypted memory
+- **TD Quote**: A cryptographically signed attestation statement
+- **RTMR (Runtime Measurement Register)**: Registers that store measurement hashes (similar to TPM PCRs)
+- **MRTD (Measurement of Trust Domain)**: Hash of the initial TD configuration
+- **DCAP (Data Center Attestation Primitives)**: Intel's attestation verification library
+
+## Quote Generation Process
+
+Umbra's attestation service generates TDX quotes using the dstack SDK:
+
+### 1. Report Data Computation
+
+The `report_data` field binds the attestation to a specific TLS session:
+
+```python
+def compute_report_data(nonce_hex: str, ekm_hex: str) -> bytes:
+    """
+    Compute report_data from nonce and EKM using SHA512.
+
+    This implements TLS channel binding for attestation.
+    The nonce provides freshness and the EKM binds to the specific TLS session.
+    Clients will verify that the same nonce and EKM were used.
+
+    Args:
+        nonce_hex: 64-character hex string (32 bytes)
+        ekm_hex: 64-character hex string (32 bytes)
+
+    Returns:
+        64-byte SHA512 hash suitable for TDX report_data
+    """
+    if len(nonce_hex) != 64:
+        raise ValueError("nonce_hex must be exactly 64 hex characters (32 bytes)")
+    if len(ekm_hex) != 64:
+        raise ValueError("ekm_hex must be exactly 64 hex characters (32 bytes)")
+    nonce = bytes.fromhex(nonce_hex)
+    ekm = bytes.fromhex(ekm_hex)
+    return hashlib.sha512(nonce + ekm).digest()
+```
+
+**Security Properties:**
+- **Freshness**: Client-generated nonce prevents replay attacks
+- **Session Binding**: EKM cryptographically binds the quote to the TLS session
+- **Integrity**: SHA512 ensures collision resistance
+
+### 2. Quote Request Flow
+
+The attestation service endpoint handles quote generation:
+
+```python
+@app.post("/tdx_quote", response_model=QuoteResponse)
+async def post_tdx_quote(request: Request, data: QuoteRequest):
+    """
+    Get TDX quote with report data.
+    """
+    # Extract and validate EKM header (see EKM Channel Binding)
+    ekm_header = request.headers.get(HEADER_TLS_EKM_CHANNEL_BINDING)
+    if not ekm_header:
+        raise HTTPException(status_code=400, detail="Missing EKM header")
+
+    # Validate HMAC signature
+    try:
+        ekm_hex = validate_and_extract_ekm(ekm_header, EKM_SHARED_SECRET)
+    except ValueError as e:
+        logger.error(f"EKM validation failed: {e}")
+        raise HTTPException(status_code=403, detail="Invalid EKM header signature")
+
+    # Compute report_data
+    report_data = compute_report_data(data.nonce_hex, ekm_hex)
+
+    # Get quote and TCB info concurrently
+    quote, info_response = await asyncio.gather(
+        dstack_client.get_quote(report_data),
+        dstack_client.info()
+    )
+    tcb_info = info_response.tcb_info
+
+    return QuoteResponse(
+        success=True,
+        quote=quote,
+        tcb_info=tcb_info,
+        timestamp=str(int(time.time())),
+        quote_type="tdx",
+    )
+```
+
+<Note>
+The service uses `asyncio.gather` to fetch the quote and TCB info concurrently for better performance.
+</Note>
+
+### 3. Quote Structure
+
+A TDX quote contains:
+
+```
+TDX Quote (1KB - 4KB):
+├── Header
+│   ├── Version (2 bytes)
+│   ├── Attestation Key Type (2 bytes)
+│   └── TEE Type (4 bytes) = TDX (0x00000081)
+├── Report Body
+│   ├── CPUSVN (16 bytes) - CPU security version
+│   ├── MISC_SELECT (4 bytes)
+│   ├── ATTRIBUTES (16 bytes)
+│   ├── MRENCLAVE (32 bytes) - Enclave measurement (N/A for TDX)
+│   ├── MRSIGNER (32 bytes) - Signer measurement (N/A for TDX)
+│   ├── MRTD (48 bytes) - Trust Domain measurement
+│   ├── RTMR[0-3] (48 bytes each) - Runtime measurements
+│   │   ├── RTMR0: Bootloader + kernel measurement
+│   │   ├── RTMR1: OS filesystem measurement
+│   │   ├── RTMR2: Application measurement (docker-compose hash)
+│   │   └── RTMR3: Reserved
+│   └── REPORTDATA (64 bytes) - SHA512(nonce + EKM)
+├── Signature (ECDSA P-256/P-384)
+└── Certification Data
+    ├── PCK Certificate Chain
+    └── TCB Info
+```
+
+## DCAP Verification Process
+
+Umbra performs **client-side verification** using Intel's DCAP QVL (Quote Verification Library) compiled to WebAssembly.
+
+### Verification Steps
+
+1. **Quote Structure Validation**
+   - Parse quote header and body
+   - Verify quote version and TEE type
+   - Validate signature algorithm
+
+2. **Certificate Chain Verification**
+   - Extract PCK (Provisioning Certification Key) certificate
+   - Verify certificate chain up to Intel root CA
+   - Check certificate revocation status
+
+3. **Quote Signature Verification**
+   - Extract ECDSA signature from quote
+   - Verify signature using PCK public key
+   - Ensure signature covers quote body and report data
+
+4. **TCB Status Evaluation**
+   - Fetch latest TCB info from Intel PCS (Provisioning Certification Service)
+   - Compare quote's TCB level with current TCB info
+   - Determine TCB status (UpToDate, SWHardeningNeeded, OutOfDate, etc.)
+
+5. **Measurement Validation**
+   - Verify MRTD matches expected bootchain
+   - Check RTMR values against policy:
+     - RTMR0: Expected boot/kernel measurement
+     - RTMR1: Expected OS image hash
+     - RTMR2: Expected docker-compose application hash
+
+6. **Report Data Verification**
+   - Extract `report_data` from quote
+   - Recompute `SHA512(nonce + EKM)` client-side
+   - Verify they match (proving session binding)
+
+<Warning>
+**Critical Security Check**: The client MUST verify that the `report_data` in the quote matches the expected `SHA512(nonce + EKM)`. This proves the quote was generated for THIS specific TLS session and prevents quote replay attacks.
+</Warning>
+
+## TCB Status Interpretation
+
+The **Trusted Computing Base (TCB)** status indicates the security level of the platform:
+
+### Status Values
+
+| Status | Meaning | Risk Level |
+|--------|---------|------------|
+| `UpToDate` | All platform components are current | ✅ **Safe** |
+| `SWHardeningNeeded` | Vulnerabilities exist but have mitigations | ⚠️ **Acceptable** (with caution) |
+| `ConfigurationNeeded` | Platform needs reconfiguration | ⚠️ **Review required** |
+| `ConfigurationAndSWHardeningNeeded` | Both configuration and updates needed | ⚠️ **Review required** |
+| `OutOfDate` | Security updates available but not applied | ❌ **Risky** |
+| `OutOfDateConfigurationNeeded` | Multiple issues | ❌ **Risky** |
+| `Revoked` | Platform has been compromised | ❌ **REJECT** |
+
+### Policy Configuration
+
+Umbra's aTLS client allows configuring acceptable TCB statuses:
+
+```typescript
+// Development policy (relaxed)
+export const DEV_POLICY: AtlasPolicy = {
+  type: "dstack_tdx",
+  disable_runtime_verification: true,
+  allowed_tcb_status: ["UpToDate", "SWHardeningNeeded", "OutOfDate"],
+}
+
+// Production policy (strict)
+const PROD_POLICY: AtlasPolicy = {
+  type: "dstack_tdx",
+  expected_bootchain: {
+    mrtd: "<expected_mrtd_hash>",
+    rtmr0: "<expected_boot_measurement>",
+    rtmr1: "<expected_os_hash>",
+    rtmr2: "<expected_app_hash>",
+  },
+  allowed_tcb_status: ["UpToDate"], // Only accept fully patched systems
+}
+```
+
+<Warning>
+**Production Recommendation**: Only accept `UpToDate` in production environments. `SWHardeningNeeded` may be acceptable if you understand the specific vulnerabilities and have implemented additional controls.
+</Warning>
+
+## Real-World Verification Example
+
+Here's how the browser verifies a quote:
+
+```typescript
+import { createAtlasClient, type AtlasPolicy } from "@/lib/atlas-client"
+
+// 1. Generate client nonce
+const nonce = crypto.getRandomValues(new Uint8Array(32))
+const nonceHex = Array.from(nonce)
+  .map(b => b.toString(16).padStart(2, '0'))
+  .join('')
+
+// 2. Create aTLS client with policy
+const policy: AtlasPolicy = {
+  type: "dstack_tdx",
+  expected_bootchain: {
+    rtmr2: "abc123..." // Expected docker-compose hash
+  },
+  allowed_tcb_status: ["UpToDate", "SWHardeningNeeded"],
+}
+
+const atlasFetch = await createAtlasClient(
+  {
+    proxyUrl: "wss://proxy.example.com",
+    targetHost: "tee.example.com:443",
+    policy,
+  },
+  async (attestation) => {
+    // This callback fires after verification succeeds
+    console.log("TEE Type:", attestation.teeType) // "TDX"
+    console.log("TCB Status:", attestation.tcbStatus) // "UpToDate"
+    console.log("Trusted:", attestation.trusted) // true
+  }
+)
+
+// 3. Make request - attestation happens automatically
+const response = await atlasFetch("/api/chat/completions", {
+  method: "POST",
+  body: JSON.stringify({ messages: [...] }),
+})
+
+// 4. Verify attestation result
+if (!response.attestation.trusted) {
+  throw new Error(`Attestation failed: ${response.attestation.tcbStatus}`)
+}
+```
+
+## Dstack Integration
+
+The attestation service uses the **dstack SDK** to interact with TDX hardware:
+
+```python
+from dstack_sdk import AsyncDstackClient
+
+# Initialize client (connects to /var/run/dstack.sock)
+dstack_client = AsyncDstackClient()
+
+# Get quote with custom report_data
+quote = await dstack_client.get_quote(report_data)
+
+# Get TCB info
+info_response = await dstack_client.info()
+tcb_info = info_response.tcb_info
+```
+
+<Note>
+The dstack daemon (`/var/run/dstack.sock`) is a privileged service that communicates with the TDX module in the Linux kernel. Only processes inside the TEE can access this socket.
+</Note>
+
+## Development Mode
+
+For local testing without TDX hardware:
+
+```bash
+# Run attestation service without dstack
+export NO_TDX=true
+cd cvm/attestation-service
+make dev
+```
+
+In development mode:
+- The service uses `EKM_SHARED_SECRET` environment variable instead of dstack key derivation
+- Quotes are still generated but may use simulated values
+- Client-side verification should use `disable_runtime_verification: true`
+
+<Warning>
+**Never use `NO_TDX=true` or `disable_runtime_verification` in production.** These modes bypass critical security checks.
+</Warning>
+
+## Troubleshooting
+
+### Quote Generation Fails
+
+```
+Error: Failed to obtain TDX quote
+```
+
+**Possible causes:**
+- dstack daemon not running (`systemctl status dstack`)
+- Socket permission issues (`/var/run/dstack.sock`)
+- TDX not enabled in BIOS
+- Kernel module not loaded (`lsmod | grep tdx`)
+
+### DCAP Verification Fails
+
+```
+Error: Attestation verification failed
+```
+
+**Possible causes:**
+- Certificate chain invalid (check Intel PCS connectivity)
+- TCB status not in allowed list
+- Measurement mismatch (MRTD/RTMR values don't match policy)
+- Clock skew (quote timestamp too far in past/future)
+
+### Report Data Mismatch
+
+```
+Error: report_data does not match expected value
+```
+
+**This is a critical security error.** Possible causes:
+- Quote replay attack (someone reusing an old quote)
+- EKM extraction failure (nginx not forwarding correct EKM)
+- Nonce generation issue (client and server disagree on nonce)
+
+<Warning>
+**Do NOT ignore report_data mismatches.** This indicates a potential security breach or misconfiguration.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="EKM Channel Binding" icon="link" href="/security/ekm-channel-binding">
+    Learn how EKM binds attestations to TLS sessions
+  </Card>
+  <Card title="RA-TLS (aTLS)" icon="lock" href="/security/atls">
+    Explore the complete aTLS implementation
+  </Card>
+  <Card title="TEE Overview" icon="shield" href="/security/tee-overview">
+    Back to TEE fundamentals
+  </Card>
+  <Card title="Attestation Service Code" icon="code" href="https://github.com/concrete-security/umbra/tree/main/cvm/attestation-service">
+    View the source code
+  </Card>
+</CardGroup>

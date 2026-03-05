@@ -1,0 +1,347 @@
+---
+title: CVM Services Overview
+description: Architecture and composition of Umbra's Confidential Virtual Machine services on Phala Cloud
+---
+
+## Introduction
+
+Umbra's Confidential Virtual Machine (CVM) infrastructure provides secure, attestable AI inference through Intel TDX technology deployed on Phala Cloud. The CVM consists of multiple coordinated services that handle TLS termination, attestation, authentication, and AI model serving.
+
+## Architecture
+
+The CVM architecture is designed around a reverse proxy pattern where all external traffic flows through an Nginx-based certificate manager that handles TLS termination and routes requests to internal services.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Phala Cloud CVM                     │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │         Nginx + Cert Manager (Port 443)          │  │
+│  │  - TLS termination                                │  │
+│  │  - EKM extraction                                 │  │
+│  │  - Let's Encrypt integration                      │  │
+│  └─────┬──────────────────┬─────────────┬───────────┘  │
+│        │                  │             │               │
+│  ┌─────▼──────────┐ ┌────▼──────┐ ┌───▼─────────┐     │
+│  │  Attestation   │ │   Auth    │ │    vLLM     │     │
+│  │   Service      │ │  Service  │ │  (GPU AI)   │     │
+│  │  (Port 8080)   │ │ (Port     │ │ (Port 8000) │     │
+│  │                │ │  8081)    │ │             │     │
+│  └────────────────┘ └───────────┘ └─────────────┘     │
+│                                                         │
+│  All services access: /var/run/dstack.sock             │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Service Components
+
+### Nginx Certificate Manager
+
+The `nginx-cert-manager` service is a combined reverse proxy and certificate management system:
+
+- **TLS Termination**: Handles all incoming HTTPS connections on port 443
+- **Certificate Management**: Automatically provisions and renews Let's Encrypt certificates
+- **EKM Extraction**: Extracts TLS Exported Keying Material (RFC 9266) for channel binding
+- **Request Routing**: Routes traffic to attestation, auth, and vLLM services
+- **ACME Challenge**: Serves HTTP-01 challenges on port 80 for Let's Encrypt
+
+### Attestation Service
+
+FastAPI-based service providing Intel TDX attestation quotes:
+
+- **Technology**: Python 3.11+ with FastAPI and dstack_sdk
+- **Port**: 8080 (internal only)
+- **Key Features**:
+  - TDX quote generation via dstack daemon
+  - EKM channel binding validation
+  - HMAC-signed header verification
+  - Report data computation (nonce + EKM)
+
+### Auth Service
+
+Minimal HTTP server for token-based authentication:
+
+- **Technology**: Python 3.10+ with standard library only
+- **Port**: 8081 (internal only)
+- **Key Features**:
+  - Bearer token validation
+  - Constant-time comparison
+  - Nginx auth_request integration
+  - Salted token hashing
+
+### vLLM Service
+
+High-performance AI inference engine:
+
+- **Technology**: vLLM with NVIDIA GPU runtime
+- **Port**: 8000 (internal only)
+- **Key Features**:
+  - OpenAI-compatible API
+  - GPU acceleration (NVIDIA runtime)
+  - Async scheduling
+  - Tool/function calling support
+
+## Docker Compose Orchestration
+
+The CVM services are orchestrated using Docker Compose with separate network isolation:
+
+```yaml
+services:
+  nginx-cert-manager:
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - vllm
+      - attestation
+      - auth
+
+  attestation-service:
+    expose:
+      - "8080"
+    networks:
+      - attestation
+
+  auth-service:
+    expose:
+      - "8081"
+    networks:
+      - auth
+
+  vllm:
+    expose:
+      - "8000"
+    networks:
+      - vllm
+    runtime: nvidia
+```
+
+### Network Isolation
+
+- **vllm network**: Connects nginx to vLLM service
+- **attestation network**: Connects nginx to attestation service
+- **auth network**: Connects nginx to auth service
+
+Services are not exposed externally and can only communicate through defined networks.
+
+## Service Communication
+
+### Request Flow
+
+1. **Client → Nginx** (Port 443)
+   - TLS 1.3 handshake
+   - Nginx extracts EKM and signs with HMAC
+
+2. **Nginx → Attestation Service** (Port 8080)
+   - Forwards request to `/tdx_quote`
+   - Adds `X-TLS-EKM-Channel-Binding` header
+   - Header format: `{ekm_hex}:{hmac_hex}`
+
+3. **Nginx → Auth Service** (Port 8081)
+   - Auth subrequest to `/_auth` endpoint
+   - Validates Bearer token
+   - Returns 200 (allow) or 401 (deny)
+
+4. **Nginx → vLLM** (Port 8000)
+   - Routes AI inference requests
+   - Proxies WebSocket connections for streaming
+
+### EKM Channel Binding
+
+The attestation service uses TLS Exported Keying Material (EKM) to bind attestation quotes to specific TLS sessions:
+
+1. Nginx extracts EKM from TLS 1.3 connection
+2. Computes `HMAC-SHA256(ekm, secret)` where secret is derived from dstack
+3. Forwards signed header to attestation service
+4. Attestation service validates HMAC before trusting EKM
+5. EKM is combined with client nonce to compute `report_data`
+
+This prevents replay attacks and ensures the attestation is bound to the current TLS session.
+
+## Development vs Production Modes
+
+### Development Mode
+
+Activated by environment variables in `docker-compose.dev.override.yml`:
+
+```yaml
+environment:
+  - DEV_MODE=true
+  - NO_TDX=true
+```
+
+**Differences**:
+- Self-signed certificates instead of Let's Encrypt
+- Mock TDX attestation (no hardware required)
+- Fixed deterministic keys for testing
+- Debug endpoints enabled
+- Verbose logging
+
+### Production Mode
+
+Default configuration in `docker-compose.yml`:
+
+```yaml
+environment:
+  - DEV_MODE=false
+  - LETSENCRYPT_STAGING=false
+```
+
+**Features**:
+- Let's Encrypt production certificates
+- Real TDX hardware attestation via dstack
+- TEE-derived cryptographic keys
+- Production logging levels
+- No debug endpoints
+
+## Volumes and Persistence
+
+### Volumes
+
+```yaml
+volumes:
+  huggingface-cache:    # AI model storage
+  tls-certs-keys:       # TLS certificates and private keys
+```
+
+### dstack Socket
+
+All services that need TEE features mount the dstack daemon socket:
+
+```yaml
+volumes:
+  - /var/run/dstack.sock:/var/run/dstack.sock
+```
+
+This provides access to:
+- TDX quote generation
+- Deterministic key derivation
+- Event emission to RTMR registers
+
+## Environment Variables
+
+### Nginx Certificate Manager
+
+- `DOMAIN`: Domain name for certificates (e.g., `vllm.concrete-security.com`)
+- `DEV_MODE`: Enable development mode (self-signed certs)
+- `LETSENCRYPT_STAGING`: Use Let's Encrypt staging environment
+- `LETSENCRYPT_ACCOUNT_VERSION`: Account identifier for rate limit management
+- `FORCE_RM_CERT_FILES`: Force certificate regeneration on startup
+- `LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARNING, ERROR)
+
+### Attestation Service
+
+- `HOST`: Bind address (default: `0.0.0.0`)
+- `PORT`: Service port (default: `8080`)
+- `WORKERS`: Number of worker processes (default: `8`)
+- `EKM_SHARED_SECRET`: Fallback HMAC key for development (production uses dstack)
+
+### Auth Service
+
+- `HOST`: Bind address (default: `0.0.0.0`)
+- `PORT`: Service port (default: `8081`)
+- `AUTH_SERVICE_TOKEN`: Bearer token for authentication
+- `MIN_AUTH_SERVICE_TOKEN_LEN`: Minimum token length (default: `32`)
+- `LOG_LEVEL`: Logging verbosity
+
+### vLLM Service
+
+- `NVIDIA_VISIBLE_DEVICES`: GPU selection (default: `all`)
+- Model configuration via command arguments in docker-compose
+
+## Deployment Replicas
+
+The attestation service supports horizontal scaling:
+
+```yaml
+attastation-service:
+  environment:
+    - WORKERS=8  # Process-level replication
+  deploy:
+    replicas: 1  # Container-level replication
+```
+
+<Note>
+For optimal performance, use either process-level (`WORKERS`) or container-level (`replicas`) scaling, not both simultaneously.
+</Note>
+
+## Health Checks
+
+All services expose health check endpoints:
+
+- **Nginx**: `GET /health` → `200 healthy`
+- **Attestation**: `GET /health` → `{"status": "healthy", "service": "attestation-service"}`
+- **Auth**: `GET /health` → `200 healthy`
+- **vLLM**: `GET /health` → JSON health status
+
+The vLLM service has an extended startup time (up to 90 minutes) for initial model loading:
+
+```yaml
+healthcheck:
+  start_interval: 1h30m
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+## Testing
+
+The CVM includes a comprehensive test suite in `test_cvm.py`:
+
+```bash
+# Full development workflow
+make dev-full
+
+# Individual test suites
+make test-health        # Health endpoints
+make test-attestation   # TDX attestation
+make test-vllm          # AI inference
+make test-ekm-headers   # EKM forwarding (dev only)
+make test-cors          # CORS configuration
+make test-metrics-auth  # Authenticated metrics
+
+# Production mode testing
+DEV=false make test-all
+```
+
+## Security Considerations
+
+### Zero-Trust Key Management
+
+- All cryptographic keys are derived from dstack inside the TEE
+- Operators never see private keys or HMAC secrets
+- Deterministic key derivation ensures consistency across restarts
+
+### Network Isolation
+
+- Services only accessible through nginx proxy
+- No direct external access to internal ports
+- Separate Docker networks for service isolation
+
+### TLS Configuration
+
+- TLS 1.3 only (required for EKM with RFC 9266)
+- Long keepalive settings (60s, 100 requests) enable session reuse
+- EKM channel binding prevents MITM attacks
+
+### Attestation
+
+- Fresh nonces prevent replay attacks
+- EKM binding ties attestation to specific TLS session
+- Report data: `SHA512(nonce || ekm)`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Attestation Service" icon="shield-check" href="/cvm/attestation-service">
+    Deep dive into TDX attestation and EKM validation
+  </Card>
+  <Card title="Auth Service" icon="key" href="/cvm/auth-service">
+    Token-based authentication implementation
+  </Card>
+  <Card title="Certificate Manager" icon="certificate" href="/cvm/cert-manager">
+    TLS certificate automation and nginx configuration
+  </Card>
+  <Card title="Deployment" icon="rocket" href="/cvm/deployment">
+    Deploy CVM services to Phala Cloud
+  </Card>
+</CardGroup>

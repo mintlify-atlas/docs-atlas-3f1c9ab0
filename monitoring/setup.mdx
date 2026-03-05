@@ -1,0 +1,240 @@
+---
+title: 'Setup Guide'
+description: 'Deploy the Prometheus and Grafana monitoring stack'
+---
+
+## Prerequisites
+
+- Docker and Docker Compose installed
+- Access to vLLM `/metrics` endpoint
+- Authentication token for remote vLLM endpoints (if applicable)
+
+## Environment Configuration
+
+<Steps>
+  <Step title="Create .env file">
+    Copy the example environment file and populate with your values:
+    
+    ```bash
+    cd monitoring
+    cp .env_example .env
+    ```
+  </Step>
+  
+  <Step title="Configure credentials">
+    Edit `.env` with your Grafana admin credentials:
+    
+    <CodeGroup>
+    ```env Local vLLM
+    # Grafana credentials
+    ADMIN_USER=admin
+    ADMIN_PASSWORD=your-secure-password
+    GRAFANA_PORT=4000
+
+    # vLLM target (local)
+    VLLM_TARGET=localhost:8000
+    SCHEME=http
+    VLLM_METRICS_AUTH_TOKEN=  # Not required for local
+
+    # Prometheus settings (defaults)
+    PROMETHEUS_PORT=9090
+    STORAGE_TSDB_RETENTION_TIME=15d
+    LOG_LEVEL=info
+    ```
+
+    ```env Remote vLLM
+    # Grafana credentials
+    ADMIN_USER=admin
+    ADMIN_PASSWORD=your-secure-password
+    GRAFANA_PORT=4000
+
+    # vLLM target (remote TEE)
+    VLLM_TARGET=vllm.concrete-security.com
+    SCHEME=https
+    VLLM_METRICS_AUTH_TOKEN=your-bearer-token
+
+    # Prometheus settings
+    PROMETHEUS_PORT=9090
+    STORAGE_TSDB_RETENTION_TIME=15d
+    LOG_LEVEL=info
+    ```
+    </CodeGroup>
+  </Step>
+  
+  <Step title="Set vLLM target">
+    Configure the vLLM endpoint to monitor:
+    
+    - **VLLM_TARGET**: Hostname or IP address of your vLLM instance
+    - **SCHEME**: Use `https` for remote endpoints, `http` for local
+    - **VLLM_METRICS_AUTH_TOKEN**: Bearer token required for remote `/metrics` access
+  </Step>
+</Steps>
+
+<Info>
+  The `.env` file is gitignored and never committed. Keep your credentials secure.
+</Info>
+
+## Starting the Stack
+
+### Quick Start
+
+The simplest way to launch the entire monitoring stack:
+
+```bash
+make docker-up
+```
+
+This command orchestrates the full workflow:
+1. Stops any running containers
+2. Generates configuration files from templates
+3. Builds Docker images
+4. Starts containers in the background
+5. Streams real-time logs
+
+### Individual Commands
+
+For more granular control, use these Make targets:
+
+| Command | Description |
+|---------|-------------|
+| `make prometheus-conf` | Generates `prometheus.yml` from template |
+| `make grafana-conf` | Generates dashboard JSON files from templates |
+| `make docker-build` | Builds the Docker images |
+| `make docker-run` | Starts the containers in the background |
+| `make docker-stop` | Stops containers and deletes generated config files |
+| `make docker-logs` | Streams real-time logs |
+
+### Step-by-Step Deployment
+
+<Steps>
+  <Step title="Generate configurations">
+    ```bash
+    make prometheus-conf
+    make grafana-conf
+    ```
+    
+    This creates:
+    - `prometheus/prometheus.yml`
+    - `grafana/provisioning/dashboards/user_metrics_overview.json`
+    - `grafana/provisioning/dashboards/machine_metrics_overview.json`
+    - `grafana/provisioning/dashboards/vllm_tokens.json`
+  </Step>
+  
+  <Step title="Build Docker images">
+    ```bash
+    make docker-build
+    ```
+    
+    Builds both Prometheus and Grafana containers.
+  </Step>
+  
+  <Step title="Start services">
+    ```bash
+    make docker-run
+    ```
+    
+    Launches containers in detached mode with health checks.
+  </Step>
+  
+  <Step title="Verify deployment">
+    ```bash
+    make docker-logs
+    ```
+    
+    Check logs for successful startup. Look for:
+    - Prometheus: `Server is ready to receive web requests`
+    - Grafana: `HTTP Server Listen`
+  </Step>
+</Steps>
+
+## Accessing Grafana
+
+Once the stack is running:
+
+1. Open your browser to `http://localhost:4000` (or your configured `GRAFANA_PORT`)
+2. Log in with the credentials from your `.env` file:
+   - Username: `ADMIN_USER`
+   - Password: `ADMIN_PASSWORD`
+3. The default home dashboard is **User Metrics Overview**
+
+<Info>
+  **First-time setup**: Grafana automatically provisions the Prometheus data source and all dashboards on startup.
+</Info>
+
+## Stopping the Stack
+
+To stop and clean up all resources:
+
+```bash
+make docker-stop
+```
+
+This command:
+- Stops and removes containers
+- Deletes generated configuration files
+- Preserves persistent Prometheus data (if configured)
+
+<Warning>
+  Generated config files are deleted on stop for security. Always use `make docker-up` or regenerate configs before restarting.
+</Warning>
+
+## Troubleshooting
+
+### Prometheus can't reach vLLM
+
+**Check your `.env` configuration**:
+- Verify `VLLM_TARGET` is correct
+- Ensure `SCHEME` matches your vLLM deployment (http/https)
+- For remote endpoints, confirm `VLLM_METRICS_AUTH_TOKEN` is valid
+
+**Test the metrics endpoint manually**:
+```bash
+# Local
+curl http://localhost:8000/metrics
+
+# Remote
+curl -H "Authorization: Bearer your-token" https://vllm.concrete-security.com/metrics
+```
+
+### Grafana shows "No Data"
+
+1. Check Prometheus is scraping successfully:
+   ```bash
+   docker compose logs prometheus | grep "/metrics"
+   ```
+
+2. Verify the Prometheus data source in Grafana:
+   - Settings > Data Sources > Prometheus
+   - Click "Test" to verify connectivity
+
+### Port conflicts
+
+If port 4000 is already in use, change `GRAFANA_PORT` in `.env` and restart:
+
+```bash
+make docker-stop
+make docker-up
+```
+
+## Advanced Configuration
+
+### Custom retention period
+
+Modify `STORAGE_TSDB_RETENTION_TIME` in `.env`:
+
+```env
+STORAGE_TSDB_RETENTION_TIME=30d  # Keep metrics for 30 days
+```
+
+### Persistent data
+
+To persist Prometheus data across restarts, set:
+
+```env
+PERSISTANT_PROMETHEUS_DATA=./prometheus_data
+```
+
+Create the directory:
+```bash
+mkdir -p prometheus_data
+```

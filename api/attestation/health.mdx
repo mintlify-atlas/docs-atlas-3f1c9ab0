@@ -1,0 +1,72 @@
+---
+title: "Health Check"
+api: "GET /health"
+---
+
+# Health Check
+
+Simple health check endpoint for the attestation service.
+
+## Endpoint
+
+```
+GET /health
+```
+
+## Authentication
+
+No authentication required.
+
+## Response
+
+Returns the service status and name.
+
+<ResponseField name="status" type="string" required>
+  Service status (always "healthy")
+</ResponseField>
+
+<ResponseField name="service" type="string" required>
+  Service identifier ("attestation-service")
+</ResponseField>
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl https://your-attestation-service.com/health
+```
+
+```python Python
+import requests
+
+response = requests.get("https://your-attestation-service.com/health")
+print(response.json())
+```
+
+```typescript TypeScript
+const response = await fetch(
+  "https://your-attestation-service.com/health"
+);
+const data = await response.json();
+console.log(data);
+```
+
+</CodeGroup>
+
+### Response
+
+```json
+{
+  "status": "healthy",
+  "service": "attestation-service"
+}
+```
+
+## Implementation Details
+
+<Note>
+This endpoint is useful for monitoring and health checks in orchestration systems like Docker Compose or Kubernetes.
+</Note>
+
+Source: `cvm/attestation-service/attestation_service.py:176-179`

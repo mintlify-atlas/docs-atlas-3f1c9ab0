@@ -1,0 +1,215 @@
+---
+title: "TDX Quote"
+api: "POST /tdx_quote"
+---
+
+# Get TDX Quote
+
+Generate an Intel TDX attestation quote with custom report data. This endpoint implements TLS channel binding using EKM (Exported Keying Material) as defined in RFC 5705.
+
+## Endpoint
+
+```
+POST /tdx_quote
+```
+
+## Authentication
+
+<Warning>
+Requires `X-TLS-EKM-Channel-Binding` header with HMAC-signed EKM value.
+</Warning>
+
+The EKM header format is `{ekm_hex}:{hmac_hex}` where:
+- `ekm_hex`: 64-character hex string (32 bytes) of the TLS Exported Keying Material
+- `hmac_hex`: 64-character HMAC-SHA256 signature of the EKM value
+
+The HMAC is computed as: `HMAC-SHA256(ekm_hex, EKM_SHARED_SECRET)`
+
+## Request Parameters
+
+<ParamField path="nonce_hex" type="string" required>
+  64-character hexadecimal string (32 bytes). Provides freshness to the attestation quote. Must be a valid hex string.
+</ParamField>
+
+## Request Body
+
+```json
+{
+  "nonce_hex": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456"
+}
+```
+
+## Response
+
+<ResponseField name="success" type="boolean" required>
+  Whether the quote generation succeeded
+</ResponseField>
+
+<ResponseField name="quote" type="GetQuoteResponse" required>
+  TDX quote object from dstack_sdk containing the raw attestation data
+</ResponseField>
+
+<ResponseField name="tcb_info" type="TcbInfoV05x" required>
+  Trusted Computing Base (TCB) information for quote verification
+</ResponseField>
+
+<ResponseField name="timestamp" type="string" required>
+  Unix timestamp (in seconds) when the quote was generated
+</ResponseField>
+
+<ResponseField name="quote_type" type="string" required>
+  Type of quote generated (always "tdx" for Intel TDX)
+</ResponseField>
+
+<ResponseField name="error" type="string" optional>
+  Error message if quote generation failed
+</ResponseField>
+
+## Error Responses
+
+### 400 Bad Request
+
+- Missing or invalid `nonce_hex` (must be exactly 64 hex characters)
+- Missing EKM header
+
+### 403 Forbidden
+
+- Invalid EKM header HMAC signature
+
+### 500 Internal Server Error
+
+- Dstack client not initialized
+- Failed to obtain TDX quote or TCB info
+- EKM_SHARED_SECRET not configured
+
+## Report Data Computation
+
+The `report_data` field in the TDX quote is computed as:
+
+```python
+report_data = SHA512(nonce_hex + ekm_hex)
+```
+
+This binds the attestation to both:
+1. The specific nonce (freshness)
+2. The TLS session via EKM (channel binding)
+
+Clients must verify that the same nonce and EKM were used when validating the quote.
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST https://your-attestation-service.com/tdx_quote \
+  -H "Content-Type: application/json" \
+  -H "X-TLS-EKM-Channel-Binding: a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456:8f3a2b1c4d5e6f7890123456789abcdef01234567890abcdef1234567890abcd" \
+  -d '{
+    "nonce_hex": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+  }'
+```
+
+```python Python
+import hmac
+import hashlib
+import secrets
+import requests
+
+# Generate a random nonce
+nonce_hex = secrets.token_hex(32)
+
+# Get EKM from TLS connection (implementation-specific)
+ekm_hex = get_ekm_from_tls_connection()
+
+# Sign EKM with shared secret
+ekm_shared_secret = "your-shared-secret"
+ekm_hmac = hmac.new(
+    ekm_shared_secret.encode("utf-8"),
+    bytes.fromhex(ekm_hex),
+    hashlib.sha256
+).hexdigest()
+
+# Make request
+response = requests.post(
+    "https://your-attestation-service.com/tdx_quote",
+    json={"nonce_hex": nonce_hex},
+    headers={
+        "X-TLS-EKM-Channel-Binding": f"{ekm_hex}:{ekm_hmac}"
+    }
+)
+
+quote_data = response.json()
+print(f"Success: {quote_data['success']}")
+print(f"Timestamp: {quote_data['timestamp']}")
+```
+
+```typescript TypeScript
+import crypto from "crypto";
+
+// Generate a random nonce
+const nonce = crypto.randomBytes(32);
+const nonceHex = nonce.toString("hex");
+
+// Get EKM from TLS connection (implementation-specific)
+const ekmHex = getEkmFromTlsConnection();
+
+// Sign EKM with shared secret
+const ekmSharedSecret = "your-shared-secret";
+const ekmHmac = crypto
+  .createHmac("sha256", ekmSharedSecret)
+  .update(Buffer.from(ekmHex, "hex"))
+  .digest("hex");
+
+// Make request
+const response = await fetch(
+  "https://your-attestation-service.com/tdx_quote",
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-TLS-EKM-Channel-Binding": `${ekmHex}:${ekmHmac}`,
+    },
+    body: JSON.stringify({ nonce_hex: nonceHex }),
+  }
+);
+
+const quoteData = await response.json();
+console.log("Success:", quoteData.success);
+console.log("Timestamp:", quoteData.timestamp);
+```
+
+</CodeGroup>
+
+### Success Response
+
+```json
+{
+  "success": true,
+  "quote": {
+    // GetQuoteResponse object from dstack_sdk
+    // Contains raw TDX quote bytes and metadata
+  },
+  "tcb_info": {
+    // TcbInfoV05x object with TCB level information
+    // Used for verifying the quote
+  },
+  "timestamp": "1709654400",
+  "quote_type": "tdx"
+}
+```
+
+## Security Considerations
+
+<Warning>
+**EKM Channel Binding**: The EKM header must be forwarded by a TLS-terminating proxy (e.g., Nginx) running inside the same TEE as the attestation service. The proxy and service must share the `EKM_SHARED_SECRET` to prevent header forgery.
+</Warning>
+
+<Note>
+**Development Mode**: In non-TEE environments, the service falls back to using the `EKM_SHARED_SECRET` environment variable. The secret must be at least 32 characters long.
+</Note>
+
+## Implementation Details
+
+The service uses the [dstack_sdk](https://github.com/Phala-Network/dstack-sdk) to interact with Intel TDX hardware. The quote generation happens asynchronously, with both the quote and TCB info fetched concurrently for optimal performance.
+
+Source: `cvm/attestation-service/attestation_service.py:182-263`

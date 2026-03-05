@@ -1,0 +1,519 @@
+---
+title: Attestation Service
+description: FastAPI service providing Intel TDX attestation quotes with EKM channel binding
+---
+
+## Overview
+
+The attestation service is a FastAPI-based REST API that generates Intel TDX attestation quotes. It provides cryptographic proof that code is running inside a trusted execution environment (TEE) and implements TLS channel binding using Exported Keying Material (EKM) as defined in RFC 9266.
+
+## Architecture
+
+### Technology Stack
+
+- **Framework**: FastAPI 0.119 with async support
+- **Python**: 3.11 - 3.13
+- **TEE Integration**: dstack_sdk 0.5.3
+- **Dependencies**: Pydantic 2.7 for validation
+- **Package Manager**: uv for fast dependency resolution
+
+### Service Configuration
+
+```yaml
+attestation-service:
+  image: ghcr.io/concrete-security/attestation-service
+  container_name: attestation-service
+  environment:
+    - HOST=0.0.0.0
+    - PORT=8080
+    - WORKERS=8
+  volumes:
+    - /var/run/dstack.sock:/var/run/dstack.sock
+  expose:
+    - "8080"
+  networks:
+    - attestation
+  deploy:
+    replicas: 1
+```
+
+## API Endpoints
+
+### Health Check
+
+```http
+GET /health
+```
+
+**Response**:
+
+```json
+{
+  "status": "healthy",
+  "service": "attestation-service"
+}
+```
+
+### TDX Quote Generation
+
+```http
+POST /tdx_quote
+Content-Type: application/json
+X-TLS-EKM-Channel-Binding: {ekm_hex}:{hmac_hex}
+
+{
+  "nonce_hex": "<64-character-hex-string>"
+}
+```
+
+**Request Body**:
+
+- `nonce_hex`: Exactly 64 hexadecimal characters (32 bytes) of random data for freshness
+
+**Response**:
+
+```json
+{
+  "success": true,
+  "quote": {
+    "quote": "<base64-encoded-tdx-quote>",
+    "event_log": "<base64-encoded-event-log>"
+  },
+  "tcb_info": {
+    "version": "0.5",
+    "id": "TDX",
+    "tcb_levels": [...]
+  },
+  "timestamp": "1234567890",
+  "quote_type": "tdx"
+}
+```
+
+### Interactive API Documentation
+
+- **Swagger UI**: `GET /docs`
+- **ReDoc**: `GET /redoc`
+
+## EKM Channel Binding
+
+### Overview
+
+The attestation service implements TLS channel binding using Exported Keying Material (EKM) to prevent man-in-the-middle attacks and bind attestation quotes to specific TLS sessions.
+
+### RFC 9266 Compliance
+
+The implementation follows [RFC 9266: Channel Bindings for TLS 1.3](https://datatracker.ietf.org/doc/rfc9266/):
+
+- Uses `tls-exporter` channel binding type
+- Requires TLS 1.3 (enforced by nginx)
+- Combines EKM with application-specific nonce
+
+### Architecture Flow
+
+```
+┌─────────┐                ┌─────────┐                ┌──────────────┐
+│ Client  │                │  Nginx  │                │ Attestation  │
+│         │                │         │                │   Service    │
+└────┬────┘                └────┬────┘                └──────┬───────┘
+     │                          │                            │
+     │ 1. TLS 1.3 Handshake     │                            │
+     │─────────────────────────>│                            │
+     │                          │                            │
+     │ 2. POST /tdx_quote       │                            │
+     │    {nonce_hex}           │                            │
+     │─────────────────────────>│                            │
+     │                          │                            │
+     │                          │ 3. Extract EKM from TLS    │
+     │                          │    context                 │
+     │                          │                            │
+     │                          │ 4. Derive HMAC key from    │
+     │                          │    dstack                  │
+     │                          │                            │
+     │                          │ 5. Sign: HMAC-SHA256(ekm)  │
+     │                          │                            │
+     │                          │ 6. Forward with signed     │
+     │                          │    header                  │
+     │                          │───────────────────────────>│
+     │                          │                            │
+     │                          │                            │ 7. Validate
+     │                          │                            │    HMAC
+     │                          │                            │
+     │                          │                            │ 8. Compute
+     │                          │                            │ report_data
+     │                          │                            │ SHA512(nonce
+     │                          │                            │ + ekm)
+     │                          │                            │
+     │                          │                            │ 9. Get TDX
+     │                          │                            │    quote from
+     │                          │                            │    dstack
+     │                          │                            │
+     │                          │ 10. Return quote           │
+     │                          │<───────────────────────────│
+     │ 11. TDX quote response   │                            │
+     │<─────────────────────────│                            │
+     │                          │                            │
+```
+
+### EKM Header Format
+
+The `X-TLS-EKM-Channel-Binding` header uses a signed format:
+
+```
+{ekm_hex}:{hmac_hex}
+```
+
+- **ekm_hex**: 64 hexadecimal characters (32 bytes of EKM material)
+- **hmac_hex**: 64 hexadecimal characters (32 bytes of HMAC-SHA256)
+- **Total length**: Exactly 129 characters (64 + 1 + 64)
+
+**Example**:
+
+```
+X-TLS-EKM-Channel-Binding: a1b2c3d4...64chars...e5f6:1a2b3c4d...64chars...5e6f
+```
+
+### HMAC Validation
+
+The service validates the HMAC signature before trusting the EKM value:
+
+```python
+def validate_and_extract_ekm(signed_header: str, secret: str) -> str:
+    """Validate HMAC signature and extract EKM value."""
+    if len(signed_header) != 129 or signed_header[64] != ":":
+        raise ValueError("Invalid EKM header format")
+
+    ekm_hex = signed_header[:64]
+    ekm_raw = bytes.fromhex(ekm_hex)
+    received_hmac = signed_header[65:]
+
+    # Compute expected HMAC
+    expected_hmac = hmac.new(
+        secret.encode("utf-8"),
+        ekm_raw,
+        hashlib.sha256
+    ).hexdigest()
+
+    # Constant-time comparison prevents timing attacks
+    if not secrets.compare_digest(received_hmac, expected_hmac):
+        raise ValueError("HMAC validation failed")
+
+    return ekm_hex
+```
+
+From `attestation_service.py:121-150`
+
+<Warning>
+The service returns HTTP 403 Forbidden if HMAC validation fails. This indicates either a compromised proxy or an attempted header forgery attack.
+</Warning>
+
+## Report Data Computation
+
+The attestation service combines the client nonce with the EKM to create the TDX report data:
+
+```python
+def compute_report_data(nonce_hex: str, ekm_hex: str) -> bytes:
+    """Compute report_data from nonce and EKM using SHA512.
+    
+    This implements TLS channel binding for attestation.
+    The nonce provides freshness and the EKM binds to the specific
+    TLS session. Clients will verify that the same nonce and EKM
+    were used.
+    """
+    if len(nonce_hex) != 64:
+        raise ValueError("nonce_hex must be exactly 64 hex characters")
+    if len(ekm_hex) != 64:
+        raise ValueError("ekm_hex must be exactly 64 hex characters")
+    
+    nonce = bytes.fromhex(nonce_hex)
+    ekm = bytes.fromhex(ekm_hex)
+    
+    # Combine and hash to create 64-byte report_data
+    return hashlib.sha512(nonce + ekm).digest()
+```
+
+From `attestation_service.py:152-174`
+
+**Properties**:
+
+- **Freshness**: Nonce prevents replay of old attestations
+- **Channel Binding**: EKM ties attestation to current TLS session
+- **Verifiability**: Client can independently compute expected report_data
+- **Size**: SHA512 output (64 bytes) fits TDX report_data field
+
+## HMAC Key Derivation
+
+### Production: dstack TEE Derivation
+
+In production, the HMAC key is derived deterministically from the TEE identity:
+
+```python
+def _get_ekm_hmac_secret() -> str:
+    """Derive EKM HMAC key from TEE."""
+    try:
+        from dstack_sdk import DstackClient
+        
+        client = DstackClient()
+        derived = client.get_key("ekm/hmac-key/v1").decode_key().hex()
+        logger.info("EKM HMAC key derived from TEE (dstack)")
+        return derived
+    except Exception as e:
+        logger.warning(
+            f"dstack key derivation failed ({e}), "
+            f"falling back to EKM_SHARED_SECRET env var"
+        )
+        # Fallback to environment variable...
+```
+
+From `attestation_service.py:94-116`
+
+**Key Properties**:
+
+- **Deterministic**: Same compose hash + key path = same key
+- **TEE-Bound**: Key never leaves the CVM
+- **Zero-Trust**: Operator never sees the key value
+- **Synchronized**: Both nginx and attestation service derive the same key
+
+### Development: Environment Variable Fallback
+
+When dstack is unavailable (development mode with `NO_TDX=true`):
+
+```bash
+export EKM_SHARED_SECRET="your-secret-key-min-32-chars"
+```
+
+<Note>
+The `EKM_SHARED_SECRET` must be at least 32 characters. The service will fail to start with a shorter secret.
+</Note>
+
+## dstack SDK Integration
+
+### Async Client Initialization
+
+The service uses an async dstack client initialized at startup:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for FastAPI app."""
+    global dstack_client
+    
+    logger.info("Initializing async dstack client...")
+    try:
+        dstack_client = AsyncDstackClient()
+    except Exception as e:
+        logger.error(f"Failed to initialize dstack client: {e}")
+    
+    yield
+    
+    logger.info("Shutting down async dstack client...")
+    dstack_client = None
+```
+
+From `attestation_service.py:63-83`
+
+### Concurrent Operations
+
+The service fetches TDX quote and TCB info concurrently:
+
+```python
+# Run both operations concurrently for better performance
+quote, info_response = await asyncio.gather(
+    dstack_client.get_quote(report_data),
+    dstack_client.info()
+)
+tcb_info = info_response.tcb_info
+```
+
+From `attestation_service.py:239-243`
+
+## Development and Testing
+
+### NO_TDX Development Mode
+
+For development without TDX hardware:
+
+```bash
+export NO_TDX=true
+export EKM_SHARED_SECRET="dev-secret-key-at-least-32-characters"
+```
+
+This allows:
+
+- Testing without dstack daemon
+- Development on non-TDX hardware
+- Mock attestation responses
+
+### Running Locally
+
+```bash
+cd attestation-service
+
+# Install dependencies
+uv sync
+
+# Development server with auto-reload
+make dev
+
+# Or manually
+uv run fastapi dev attestation_service.py --port 8080
+```
+
+### Running Tests
+
+```bash
+# Unit tests
+make pytest
+
+# Or with uv
+uv run pytest tests/ -v
+```
+
+### Debug Endpoints
+
+For integration testing, use `attestation_service_with_debug.py`:
+
+```bash
+uv run fastapi run attestation_service_with_debug.py --port 8080
+```
+
+Adds:
+
+- `GET /debug/ekm`: Verify EKM header forwarding and HMAC validation
+
+<Warning>
+Never use debug endpoints in production deployments.
+</Warning>
+
+## Docker Image
+
+### Building
+
+```dockerfile
+FROM python:3.11-slim
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY pyproject.toml .
+RUN uv sync --frozen
+
+COPY attestation_service.py .
+
+CMD ["uv", "run", "fastapi", "run", "attestation_service.py", \
+     "--host", "0.0.0.0", "--port", "8080", "--workers", "8"]
+```
+
+### Published Images
+
+Images are published to GitHub Container Registry:
+
+```yaml
+image: ghcr.io/concrete-security/attestation-service@sha256:e7f82b46...
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `8080` | Service port |
+| `WORKERS` | `8` | Number of worker processes |
+| `EKM_SHARED_SECRET` | - | HMAC key for dev mode (min 32 chars) |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `NO_TDX` | `false` | Disable dstack integration |
+
+## Scaling Configuration
+
+### Process-Level Scaling
+
+Use multiple worker processes:
+
+```yaml
+environment:
+  - WORKERS=8
+deploy:
+  replicas: 1
+```
+
+### Container-Level Scaling
+
+Use multiple container replicas:
+
+```yaml
+environment:
+  - WORKERS=1
+deploy:
+  replicas: 8
+```
+
+<Note>
+Choose one scaling approach (process or container level) for optimal performance. Using both simultaneously provides no additional benefit.
+</Note>
+
+## Security Considerations
+
+### Defense in Depth
+
+The EKM validation provides multiple security layers:
+
+1. **Network Isolation**: Attestation service only accessible from nginx
+2. **HMAC Validation**: Prevents header forgery even if proxy is compromised
+3. **TEE Key Derivation**: HMAC key never leaves the CVM
+4. **Constant-Time Comparison**: Prevents timing attacks on HMAC validation
+
+### Threat Model
+
+Protection against:
+
+- **Proxy Compromise**: HMAC prevents forged EKM values
+- **Replay Attacks**: Nonce provides freshness
+- **MITM Attacks**: EKM binds to specific TLS session
+- **Timing Attacks**: Constant-time HMAC comparison
+
+### Best Practices
+
+- Never expose port 8080 externally
+- Use dstack key derivation in production (not `EKM_SHARED_SECRET`)
+- Ensure nginx and attestation service share the same dstack socket
+- Monitor for HMAC validation failures (may indicate attacks)
+
+## Error Handling
+
+### Common Errors
+
+| Status | Cause | Solution |
+|--------|-------|----------|
+| `400 Bad Request` | Missing EKM header | Check nginx configuration |
+| `403 Forbidden` | Invalid HMAC signature | Verify shared secret matches |
+| `500 Internal Server Error` | Dstack client not initialized | Check dstack socket mount |
+| `422 Unprocessable Entity` | Invalid nonce format | Ensure 64-character hex string |
+
+### Example Error Response
+
+```json
+{
+  "detail": "Invalid EKM header signature"
+}
+```
+
+## Monitoring
+
+Key metrics to track:
+
+- Request rate to `/tdx_quote`
+- HMAC validation failure rate
+- TDX quote generation latency
+- Dstack client errors
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Auth Service" icon="key" href="/cvm/auth-service">
+    Implement token-based authentication
+  </Card>
+  <Card title="Certificate Manager" icon="certificate" href="/cvm/cert-manager">
+    Configure nginx and TLS certificates
+  </Card>
+</CardGroup>

@@ -1,0 +1,134 @@
+---
+title: Frontend Overview
+description: Umbra's Next.js 16 frontend application with React 19, TypeScript, and Confidential AI workspace
+---
+
+Umbra's frontend is a Next.js 16 application that provides the marketing site and secure workspace for routing sensitive documents into trusted execution environments (TEEs). It combines Supabase-backed authentication, RA-TLS attestation verification, and a streaming chat interface with PDF tooling.
+
+## Tech Stack
+
+The frontend is built with modern web technologies:
+
+- **Framework**: Next.js 16 (App Router) with React 19
+- **Language**: TypeScript (strict mode)
+- **Styling**: Tailwind CSS 3.4 with CSS variables in `styles/globals.css`
+- **UI Components**: Radix UI primitives with shadcn/ui patterns
+- **Fonts**: Geist font family
+- **Package Manager**: pnpm 10.15.1 (pinned in `package.json`)
+
+## Application Surfaces
+
+### Landing Page
+
+The landing page (`app/page.tsx`) features:
+
+- Hero prompt + attachment form that stores initial context in `sessionStorage` for replay in the confidential workspace
+- Trust badges and security flow diagram highlighting platform credibility
+- Waitlist CTA and floating `FeedbackButton` that submit through `/api/waitlist` and `/api/feedback`
+- Anti-bot protections using signed form tokens and honeypot fields
+
+### Team Page
+
+The team page (`app/team/page.tsx`) displays:
+
+- Team members and advisory board
+- Links to LinkedIn profiles
+
+### Confidential AI Workspace
+
+The confidential workspace (`app/confidential-ai/page.tsx`) provides:
+
+- **Streaming chat client** with reasoning panel, cache salt input, file uploads
+- **PDF support** via pdf.js (loaded from `/pdfjs/*`, worker in `workers/pdf.worker.ts`)
+- **Provider settings** stored entirely in browser (localStorage for base/model/label, sessionStorage for tokens)
+- **RA-TLS connection** establishing cryptographically verified connection to TEE via WebSocket proxy
+- **Attestation verification** using `@concrete-security/atlas-wasm` library (TLS handshake and attestation performed in-browser)
+- **Guest throttling** (optional) limiting anonymous visitors to single session before requiring auth
+- **Transcript controls** for managing conversation history
+- **Hex cipher preview** showing encrypted content before sending
+
+The UI blocks all prompts until RA-TLS connection is established and attestation verification succeeds, displaying TEE type and TCB status.
+
+### Authentication & Waitlist Flows
+
+- `/sign-in` renders Supabase email/password form plus waitlist request form
+- `/admin/waitlist` allows admins to filter, annotate, and activate requests
+- Activation generates Supabase magic links, records invite metadata, and dispatches branded emails via Resend
+- Roles granted automatically only after recipients verify email
+- `middleware.ts` and `SupabaseAuthListener` keep SSR and client state synchronized
+
+## API Routes
+
+Key API endpoints:
+
+| Route | Purpose |
+|-------|--------|
+| `/api/chat/completions` | Proxies OpenAI-compatible streaming requests to configured provider with HTTPS/loopback enforcement |
+| `/api/waitlist` | Waitlist intake with rate limiting, form token validation, and CSRF checks |
+| `/api/feedback` | Feedback submission with same security controls |
+| `/api/form-token` | Generates signed HMAC tokens for forms |
+| `/api/admin/waitlist/*` | Admin-only CRUD + activation flows using Supabase service-role client |
+
+## Repository Structure
+
+| Path | Description |
+|------|-------------|
+| `app/` | Route tree for marketing pages, confidential workspace, auth, admin console, and API handlers |
+| `components/` | Shared UI primitives (feedback-button, markdown, chunk-recovery, supabase-auth-listener, etc.) |
+| `hooks/` | Reusable hooks (currently `use-form-token`) |
+| `lib/` | Supabase helpers, chat proxy logic, RA-TLS client wrapper, email templates, security helpers, waitlist types, system prompt |
+| `ratls-wasm/` | Local copy of RA-TLS WASM package (gitignored, copied from `../ratls/wasm/pkg` during build) |
+| `public/` | Static assets (logos, pdf.js distribution, testimonial portraits) |
+| `scripts/` | Tooling helpers for local experiments and diagnostics |
+| `supabase/` | SQL schema for `waitlist_requests`, indexes, enums, and policies |
+| `tests/` | `tests/unit` (Vitest) and `tests/e2e` (Playwright) |
+| `workers/` | Standalone workers (pdf.js worker) |
+| `Makefile` | Helper targets for install/dev/test/build workflows |
+
+## Key Libraries
+
+### Authentication & Database
+
+- `@supabase/ssr` + `@supabase/supabase-js` for authentication, waitlist storage, and magic links
+- Centralized clients in `lib/supabase/` (client, server, route-handler, service-role)
+
+### RA-TLS & Attestation
+
+- `@concrete-security/atlas-wasm` for TLS handshake and attestation verification in-browser
+- `lib/ratls-client.ts` wraps WASM module with lazy loading and browser-only execution
+- WebSocket proxy bridges to TCP for TEE connections
+- Intel DCAP verification performed client-side
+
+### PDF Processing
+
+- `pdfjs-dist` for PDF text extraction
+- Assets checked in under `public/pdfjs`
+- Dedicated worker in `workers/pdf.worker.ts`
+
+### Email
+
+- Resend for email delivery
+- HTML/text templates in `lib/email/templates/`
+
+### UI & Rendering
+
+- `react-markdown` with `remark-gfm` and `rehype-sanitize` for safe Markdown rendering
+- Custom copy buttons for code blocks
+- `framer-motion` for animations
+- `sonner` for toast notifications
+
+## Security Features
+
+- **CSP, HSTS, Referrer Policy** and other headers defined in `next.config.mjs`
+- **RA-TLS attestation** blocks messaging until TEE verification succeeds
+- **CSRF protection** via `ensureSameOrigin`, `assertJsonRequest`, and `verifyFormToken`
+- **Rate limiting** (5 waitlist/min/IP, 3 feedback/2min/IP) in `lib/security/rate-limit.ts`
+- **Form tokens** with 10-minute expiry using HMAC signatures
+- **Markdown sanitization** in rendering pipeline
+- **Chunk recovery** component handles CDN bundle evictions gracefully
+
+## Next Steps
+
+- [Setup Guide](/frontend/setup) - Install and configure the frontend locally
+- [Environment Variables](/frontend/environment-variables) - Complete reference for all env vars
+- [Testing](/frontend/testing) - Run Vitest and Playwright test suites

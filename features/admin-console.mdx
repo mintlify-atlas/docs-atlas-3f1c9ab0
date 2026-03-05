@@ -1,0 +1,565 @@
+---
+title: "Admin Console"
+description: "Waitlist management, user activation, and role administration"
+---
+
+The Admin Console provides a centralized interface for managing waitlist requests, activating users, and administering roles during Umbra's beta phase.
+
+## Overview
+
+The admin console is accessible at `/admin/waitlist` and provides:
+
+- **Waitlist request management** - View, filter, and annotate incoming requests
+- **User activation workflow** - Generate magic links and send invitation emails
+- **Status tracking** - Monitor request lifecycle from submission to activation
+- **Priority management** - Prioritize requests and add internal notes
+
+<Warning>
+  Admin console access requires the `admin` role in Supabase user metadata. See [Authentication System](/features/authentication) for role configuration.
+</Warning>
+
+## Waitlist Management
+
+The waitlist system controls access during beta by requiring manual approval:
+
+### Request Lifecycle
+
+<Steps>
+  <Step title="Requested">
+    User submits email, company, and use case via landing page or sign-in form. Initial status is `requested`.
+  </Step>
+  
+  <Step title="Contacted (Optional)">
+    Admin can manually update status to `contacted` after reaching out to the user outside the platform.
+  </Step>
+  
+  <Step title="Invited">
+    Admin sends invitation email with magic link. Status automatically updates to `invited` and `activation_sent_at` is recorded.
+  </Step>
+  
+  <Step title="Activated">
+    User clicks magic link and verifies email. Database trigger promotes user to `member` role and updates status to `activated`.
+  </Step>
+  
+  <Step title="Archived">
+    Admin can archive declined or closed requests by setting status to `archived`.
+  </Step>
+</Steps>
+
+### Waitlist Table Structure
+
+Requests are stored in the `waitlist_requests` table:
+
+```sql:frontend/supabase/schema.sql
+create table public.waitlist_requests (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default timezone('utc', now()),
+  email citext not null unique,           -- User email (case-insensitive)
+  company text,                            -- Optional company name
+  use_case text,                           -- Optional use case description
+  status public.waitlist_status not null default 'requested',
+  notes text,                              -- Admin notes (internal only)
+  priority integer,                        -- Admin priority (higher = more urgent)
+  last_contacted_at timestamptz,           -- Last contact timestamp
+  supabase_user_id uuid references auth.users (id) on delete set null,
+  activation_sent_at timestamptz,          -- When invitation was sent
+  activation_link text,                    -- Generated magic link
+  activated_at timestamptz,                -- When user verified email
+  metadata jsonb                           -- Additional structured data
+);
+```
+
+### Status Enum
+
+```sql:frontend/supabase/schema.sql
+create type public.waitlist_status as enum (
+  'requested',   -- Initial submission
+  'contacted',   -- Admin reached out manually
+  'invited',     -- Magic link sent
+  'activated',   -- User verified email and promoted
+  'archived'     -- Closed/declined
+);
+```
+
+## User Activation Workflow
+
+Activating a waitlist request generates a magic link and sends an invitation email:
+
+### Activation Process
+
+<Steps>
+  <Step title="Admin Review">
+    Admin views request details in `/admin/waitlist`, reviews company and use case, adds priority and notes.
+  </Step>
+  
+  <Step title="Send Invitation">
+    Admin clicks "Send Invitation" button, triggering `/api/admin/waitlist/[id]/activate`.
+  </Step>
+  
+  <Step title="Magic Link Generation">
+    Endpoint generates Supabase magic link with user metadata (company, use case) embedded.
+  </Step>
+  
+  <Step title="Email Dispatch">
+    Branded invitation email sent via Resend with magic link and personalized content.
+  </Step>
+  
+  <Step title="User Verification">
+    User clicks magic link, verifies email, and database trigger automatically promotes to `member` role.
+  </Step>
+</Steps>
+
+### Activation API Endpoint
+
+The activation endpoint is protected by admin role checks:
+
+```typescript:frontend/app/api/admin/waitlist/[id]/activate/route.ts
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  // Ensure same-origin request
+  try {
+    ensureSameOrigin(request)
+  } catch (error) {
+    if (error instanceof CrossOriginRequestError) {
+      return NextResponse.json({ error: error.message }, { status: 403 })
+    }
+    throw error
+  }
+
+  // Verify admin role
+  const supabase = await createSupabaseRouteHandlerClient()
+  try {
+    await requireAdminUser(supabase)
+  } catch (error) {
+    if (error instanceof AuthenticatedAccessError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
+    throw error
+  }
+
+  // Load waitlist entry
+  const { id: entryId } = await params
+  const serviceRole = createSupabaseServiceRoleClient()
+  const { data: entry, error: entryError } = await serviceRole
+    .from("waitlist_requests")
+    .select("*")
+    .eq("id", entryId)
+    .maybeSingle()
+
+  if (entryError || !entry) {
+    return NextResponse.json({ error: "Waitlist entry not found" }, { status: 404 })
+  }
+
+  // Generate magic link
+  const appUrl = resolveAppUrl(request)
+  const redirectTo = `${appUrl}/sign-in?redirect=/confidential-ai`
+
+  const { data: linkData, error: linkError } = await serviceRole.auth.admin.generateLink({
+    type: "magiclink",
+    email: entry.email,
+    options: {
+      redirectTo,
+      data: {
+        waitlist_request_id: entry.id,
+        company: entry.company ?? undefined,
+        use_case: entry.use_case ?? undefined,
+      },
+    },
+  })
+
+  if (linkError || !linkData?.properties?.action_link) {
+    return NextResponse.json({ error: "Unable to generate activation link" }, { status: 500 })
+  }
+
+  const magicLink = linkData.properties.action_link
+  const supabaseUserId = linkData.user?.id ?? entry.supabase_user_id ?? null
+
+  // Send invitation email
+  try {
+    await sendWaitlistActivationEmail({
+      email: entry.email,
+      magicLink,
+      company: entry.company,
+      useCase: entry.use_case,
+    })
+  } catch (error) {
+    return NextResponse.json({ error: "Failed to deliver activation email" }, { status: 500 })
+  }
+
+  // Update waitlist entry
+  const now = new Date().toISOString()
+  const { data: updatedEntry, error: updateError } = await serviceRole
+    .from("waitlist_requests")
+    .update({
+      status: "invited",
+      last_contacted_at: now,
+      activation_sent_at: now,
+      activation_link: magicLink,
+      supabase_user_id: supabaseUserId,
+    })
+    .eq("id", entryId)
+    .select("*")
+    .maybeSingle()
+
+  if (updateError || !updatedEntry) {
+    return NextResponse.json({ error: "Failed to update waitlist entry" }, { status: 500 })
+  }
+
+  return NextResponse.json({ request: updatedEntry })
+}
+```
+
+### Magic Link Configuration
+
+Magic links include:
+
+- **Email**: User's email address from waitlist
+- **Redirect**: Post-verification redirect to `/confidential-ai`
+- **Metadata**: Company and use case embedded in user profile
+
+```typescript
+const { data: linkData } = await serviceRole.auth.admin.generateLink({
+  type: "magiclink",
+  email: entry.email,
+  options: {
+    redirectTo: `${appUrl}/sign-in?redirect=/confidential-ai`,
+    data: {
+      waitlist_request_id: entry.id,
+      company: entry.company ?? undefined,
+      use_case: entry.use_case ?? undefined,
+    },
+  },
+})
+```
+
+## Admin Role Requirements
+
+Admin console access is protected by role-based access control:
+
+### Role Assignment
+
+Manually grant admin role via Supabase SQL editor:
+
+```sql
+update auth.users
+set raw_app_meta_data = jsonb_set(
+  coalesce(raw_app_meta_data, '{}'),
+  '{roles}',
+  '["admin"]'::jsonb,
+  true
+)
+where email = 'admin@example.com';
+```
+
+<Note>
+  Roles are stored in `auth.users.raw_app_meta_data` as a JSON array. Users can have multiple roles (e.g., `["admin", "member"]`).
+</Note>
+
+### Role Verification
+
+The `requireAdminUser()` helper enforces admin access:
+
+```typescript:frontend/lib/auth.ts
+export async function requireAdminUser(client: SupabaseClient): Promise<User> {
+  const { data, error } = await client.auth.getUser()
+
+  if (error || !data?.user) {
+    throw new AuthenticatedAccessError("Authentication required", 401)
+  }
+
+  const roles = (data.user.app_metadata?.roles as string[] | undefined) ?? []
+  if (!roles.includes("admin")) {
+    throw new AuthenticatedAccessError("Administrator role required", 403)
+  }
+
+  return data.user
+}
+```
+
+### Protected Routes
+
+All admin routes use `requireAdminUser()`:
+
+```typescript:frontend/app/api/admin/waitlist/route.ts
+export async function GET(request: Request) {
+  const supabase = await createSupabaseRouteHandlerClient()
+  
+  try {
+    await requireAdminUser(supabase)
+  } catch (error) {
+    if (error instanceof AuthenticatedAccessError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
+    throw error
+  }
+  
+  // Fetch waitlist requests
+  const serviceRole = createSupabaseServiceRoleClient()
+  const { data: requests, error: fetchError } = await serviceRole
+    .from("waitlist_requests")
+    .select("*")
+    .order("created_at", { ascending: false })
+
+  if (fetchError) {
+    return NextResponse.json({ error: "Failed to load requests" }, { status: 500 })
+  }
+
+  return NextResponse.json({ requests })
+}
+```
+
+## Email Dispatch via Resend
+
+Invitation emails are sent using Resend with branded HTML templates:
+
+### Email Template
+
+```typescript:frontend/lib/email/templates/waitlist-activation.ts
+import { Resend } from 'resend'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+export async function sendWaitlistActivationEmail({
+  email,
+  magicLink,
+  company,
+  useCase,
+}: {
+  email: string
+  magicLink: string
+  company?: string | null
+  useCase?: string | null
+}) {
+  const subject = 'Welcome to Umbra - Your Access is Ready'
+  
+  const htmlBody = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: sans-serif; line-height: 1.6; }
+          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+          .button { display: inline-block; padding: 12px 24px; background: #0066CC; color: white; text-decoration: none; border-radius: 4px; }
+          .metadata { background: #f5f5f5; padding: 12px; border-radius: 4px; margin-top: 20px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>Welcome to Umbra</h1>
+          <p>Your access to Umbra's confidential AI workspace has been approved.</p>
+          <p><a href="${magicLink}" class="button">Activate Your Account</a></p>
+          <p>Or copy this link into your browser:</p>
+          <p style="word-break: break-all; font-size: 12px; color: #666;">${magicLink}</p>
+          ${company || useCase ? `
+            <div class="metadata">
+              ${company ? `<p><strong>Company:</strong> ${company}</p>` : ''}
+              ${useCase ? `<p><strong>Use case:</strong> ${useCase}</p>` : ''}
+            </div>
+          ` : ''}
+          <hr style="margin: 30px 0; border: none; border-top: 1px solid #ddd;">
+          <p style="font-size: 12px; color: #666;">
+            This invitation was sent by Concrete Security. If you didn't request access, you can ignore this email.
+          </p>
+        </div>
+      </body>
+    </html>
+  `
+  
+  const textBody = `
+Welcome to Umbra
+
+Your access to Umbra's confidential AI workspace has been approved.
+
+Activate your account by visiting this link:
+${magicLink}
+
+${company ? `Company: ${company}\n` : ''}${useCase ? `Use case: ${useCase}\n` : ''}
+
+This invitation was sent by Concrete Security. If you didn't request access, you can ignore this email.
+  `.trim()
+
+  const { error } = await resend.emails.send({
+    from: process.env.RESEND_FROM_EMAIL ?? 'Concrete Security <onboarding@resend.dev>',
+    to: email,
+    subject,
+    html: htmlBody,
+    text: textBody,
+  })
+
+  if (error) {
+    throw new Error(`Resend API error: ${error.message}`)
+  }
+}
+```
+
+### Email Configuration
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `RESEND_API_KEY` | Yes | Resend API key for email delivery |
+| `RESEND_FROM_EMAIL` | Optional | Override sender email (default: `Concrete Security <onboarding@resend.dev>`) |
+
+<Warning>
+  Without `RESEND_API_KEY`, activation endpoints will fail with HTTP 500. In development, emails are logged but not sent.
+</Warning>
+
+## Admin Console UI
+
+The admin console client is implemented in `/admin/waitlist/client.tsx`:
+
+### Key Features
+
+- **Filterable table** - Search by email, company, or use case
+- **Status badges** - Visual indicators for request lifecycle
+- **Priority sorting** - Sort by admin-assigned priority
+- **Inline notes** - Add internal notes to requests
+- **Bulk actions** (future) - Update multiple requests at once
+
+### Client Implementation
+
+```typescript:frontend/app/admin/waitlist/client.tsx
+export function WaitlistAdminClient() {
+  const [requests, setRequests] = useState<WaitlistRequest[]>([])
+  const [loading, setLoading] = useState(true)
+
+  // Fetch requests
+  useEffect(() => {
+    async function loadRequests() {
+      const response = await fetch('/api/admin/waitlist')
+      if (response.ok) {
+        const data = await response.json()
+        setRequests(data.requests)
+      }
+      setLoading(false)
+    }
+    void loadRequests()
+  }, [])
+
+  // Send invitation
+  async function handleActivate(id: string) {
+    const response = await fetch(`/api/admin/waitlist/${id}/activate`, {
+      method: 'POST',
+    })
+    if (response.ok) {
+      // Refresh list
+      const listResponse = await fetch('/api/admin/waitlist')
+      const data = await listResponse.json()
+      setRequests(data.requests)
+    }
+  }
+
+  // Render table...
+}
+```
+
+## API Endpoints
+
+### List Waitlist Requests
+
+**Endpoint:** `GET /api/admin/waitlist`
+
+**Response:**
+```json
+{
+  "requests": [
+    {
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "created_at": "2024-01-15T10:30:00Z",
+      "email": "user@example.com",
+      "company": "Acme Corp",
+      "use_case": "Financial document processing",
+      "status": "requested",
+      "priority": 5,
+      "notes": "High-value prospect"
+    }
+  ]
+}
+```
+
+### Get Single Request
+
+**Endpoint:** `GET /api/admin/waitlist/[id]`
+
+### Update Request
+
+**Endpoint:** `PATCH /api/admin/waitlist/[id]`
+
+**Request Body:**
+```json
+{
+  "status": "contacted",
+  "priority": 10,
+  "notes": "Called on 2024-01-15, very interested"
+}
+```
+
+### Activate Request
+
+**Endpoint:** `POST /api/admin/waitlist/[id]/activate`
+
+**Response:**
+```json
+{
+  "request": {
+    "id": "123e4567-e89b-12d3-a456-426614174000",
+    "status": "invited",
+    "activation_sent_at": "2024-01-15T11:00:00Z",
+    "activation_link": "https://app.supabase.io/..."
+  }
+}
+```
+
+## Configuration Reference
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes | Public anon key |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | Service role key for admin operations |
+| `RESEND_API_KEY` | Yes | Resend API key for email delivery |
+| `RESEND_FROM_EMAIL` | Optional | Override sender email |
+| `NEXT_PUBLIC_APP_URL` | Recommended | Canonical origin for magic links |
+
+### Database Setup
+
+Run the schema migration in Supabase SQL editor:
+
+```bash
+psql -h db.project.supabase.co -U postgres -f frontend/supabase/schema.sql
+```
+
+Or paste the contents of `supabase/schema.sql` into the SQL editor.
+
+## Security Considerations
+
+<CardGroup cols={2}>
+  <Card title="Same-Origin Enforcement" icon="shield">
+    All admin endpoints verify request origin using `ensureSameOrigin()` to prevent CSRF attacks.
+  </Card>
+  
+  <Card title="Role-Based Access" icon="lock">
+    Every endpoint checks for `admin` role using `requireAdminUser()` before processing requests.
+  </Card>
+  
+  <Card title="Service Role Isolation" icon="database">
+    Service role client used only server-side. Never exposed to browser.
+  </Card>
+  
+  <Card title="RLS Policies" icon="shield-check">
+    Row Level Security ensures only service role can access `waitlist_requests` table.
+  </Card>
+</CardGroup>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Authentication System" href="/features/authentication" icon="key">
+    Learn about Supabase integration and role management
+  </Card>
+  
+  <Card title="Waitlist Flow" href="/guides/waitlist-setup" icon="list-check">
+    Step-by-step guide for configuring waitlist
+  </Card>
+</CardGroup>

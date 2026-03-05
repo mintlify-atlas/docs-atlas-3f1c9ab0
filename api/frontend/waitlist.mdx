@@ -1,0 +1,233 @@
+---
+title: "Waitlist Signup"
+api: "POST /api/waitlist"
+---
+
+# Waitlist Signup
+
+Submit a waitlist request to join the Umbra beta program.
+
+## Endpoint
+
+```
+POST /api/waitlist
+```
+
+## Authentication
+
+<Warning>
+Requires a valid form token obtained from the `/api/form-token` endpoint.
+</Warning>
+
+## Rate Limiting
+
+5 requests per minute per IP address. Returns `429 Too Many Requests` with a `Retry-After` header when exceeded.
+
+## Security Requirements
+
+- Must be same-origin request (checked via `Origin` header)
+- Must have `Content-Type: application/json`
+- Must include valid form token (10-minute expiry)
+- Honeypot field (`checkpoint`) must be empty
+
+## Request Parameters
+
+<ParamField path="email" type="string" required>
+  Email address (max 160 characters). Must be a valid email format.
+</ParamField>
+
+<ParamField path="company" type="string" optional>
+  Company name (max 160 characters)
+</ParamField>
+
+<ParamField path="use_case" type="string" optional>
+  Description of intended use case (max 320 characters)
+</ParamField>
+
+<ParamField path="metadata" type="object" optional>
+  Additional metadata as key-value pairs (max 12 entries)
+</ParamField>
+
+<ParamField path="form_token" type="string" required>
+  HMAC-signed form token from `/api/form-token`
+</ParamField>
+
+<ParamField path="checkpoint" type="string" hidden>
+  Honeypot field for bot detection (must be empty)
+</ParamField>
+
+## Request Body
+
+```json
+{
+  "email": "user@example.com",
+  "company": "Acme Corp",
+  "use_case": "Processing sensitive medical data in TEEs",
+  "metadata": {
+    "source": "homepage",
+    "referrer": "search"
+  },
+  "form_token": "a1b2c3d4e5f6.1709654400.8f3a2b1c4d5e6f7890123456789abcdef0123456",
+  "checkpoint": ""
+}
+```
+
+## Response
+
+<ResponseField name="success" type="boolean" required>
+  Whether the signup was successful
+</ResponseField>
+
+## Error Responses
+
+### 400 Bad Request
+
+- Missing or invalid email
+- Missing or expired form token
+- Honeypot field not empty
+
+### 403 Forbidden
+
+- Cross-origin request blocked
+
+### 415 Unsupported Media Type
+
+- Missing or invalid `Content-Type` header
+
+### 422 Unprocessable Entity
+
+- Email format validation failed
+
+### 429 Too Many Requests
+
+- Rate limit exceeded (includes `Retry-After` header with seconds to wait)
+
+### 500 Internal Server Error
+
+- Database error
+- Unexpected server error
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+# First, get a form token
+TOKEN=$(curl https://umbra.concrete-security.com/api/form-token | jq -r '.token')
+
+# Then submit the waitlist request
+curl -X POST https://umbra.concrete-security.com/api/waitlist \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://umbra.concrete-security.com" \
+  -d "{
+    \"email\": \"user@example.com\",
+    \"company\": \"Acme Corp\",
+    \"use_case\": \"Processing sensitive medical data\",
+    \"form_token\": \"$TOKEN\",
+    \"checkpoint\": \"\"
+  }"
+```
+
+```typescript TypeScript
+// First, get a form token
+const tokenResponse = await fetch("/api/form-token");
+const { token } = await tokenResponse.json();
+
+// Submit waitlist request
+const response = await fetch("/api/waitlist", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    email: "user@example.com",
+    company: "Acme Corp",
+    use_case: "Processing sensitive medical data in TEEs",
+    metadata: {
+      source: "homepage",
+    },
+    form_token: token,
+    checkpoint: "",
+  }),
+});
+
+if (!response.ok) {
+  const error = await response.json();
+  console.error("Signup failed:", error.error);
+} else {
+  const data = await response.json();
+  console.log("Success:", data.success);
+}
+```
+
+```python Python
+import requests
+
+# First, get a form token
+token_response = requests.get("https://umbra.concrete-security.com/api/form-token")
+token = token_response.json()["token"]
+
+# Submit waitlist request
+response = requests.post(
+    "https://umbra.concrete-security.com/api/waitlist",
+    json={
+        "email": "user@example.com",
+        "company": "Acme Corp",
+        "use_case": "Processing sensitive medical data in TEEs",
+        "metadata": {"source": "homepage"},
+        "form_token": token,
+        "checkpoint": "",
+    },
+    headers={"Origin": "https://umbra.concrete-security.com"},
+)
+
+if response.ok:
+    print("Success:", response.json()["success"])
+else:
+    print("Error:", response.json()["error"])
+```
+
+</CodeGroup>
+
+### Success Response
+
+```json
+{
+  "success": true
+}
+```
+
+### Error Response
+
+```json
+{
+  "error": "Email is required"
+}
+```
+
+## Data Handling
+
+<Note>
+Waitlist requests are stored in Supabase with `upsert` behavior using email as the conflict key. Submitting the same email multiple times will update the existing record.
+</Note>
+
+## Validation Rules
+
+- **Email**: Required, max 160 characters, must match basic email regex (`/^[^\s@]+@[^\s@]+\.[^\s@]+$/`), converted to lowercase
+- **Company**: Optional, max 160 characters, trimmed
+- **Use Case**: Optional, max 320 characters, trimmed
+- **Metadata**: Optional object with max 12 string key-value pairs, empty values filtered out
+- **Form Token**: Required, must be valid HMAC signature and not expired (10-minute TTL)
+- **Checkpoint**: Must be empty (honeypot field)
+
+## Implementation Details
+
+The endpoint implements multiple security layers:
+- Same-origin enforcement via header validation
+- Rate limiting per IP address (5 req/min)
+- HMAC-signed form tokens with expiry
+- Honeypot field for bot detection
+- Input sanitization and validation
+- Supabase Row-Level Security (RLS) policies
+
+Source: `frontend/app/api/waitlist/route.ts`

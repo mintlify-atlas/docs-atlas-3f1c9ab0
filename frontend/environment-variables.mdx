@@ -1,0 +1,206 @@
+---
+title: Environment Variables
+description: Complete reference for all Umbra frontend environment variables
+---
+
+The Umbra frontend uses environment variables for configuration across authentication, provider settings, RA-TLS attestation, email delivery, and runtime toggles.
+
+<Note>
+  Store sensitive variables in `.env.local` (never committed to git). Use `.env.example` as a template.
+</Note>
+
+## Core Authentication & Origin
+
+Required variables for Supabase authentication and CSRF protection.
+
+<ParamField path="NEXT_PUBLIC_SUPABASE_URL" type="string" required>
+  Supabase project URL shared by browser, server components, and service-role clients.
+  
+  **Example**: `https://xxxxx.supabase.co`
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_SUPABASE_ANON_KEY" type="string" required>
+  Public anon key for Supabase authentication. Safe to expose in browser.
+  
+  **Location**: Supabase Dashboard → Settings → API → Project API keys
+</ParamField>
+
+<ParamField path="SUPABASE_SERVICE_ROLE_KEY" type="string" required>
+  Service role key with elevated privileges. Needed by server routes (`/api/waitlist`, `/api/admin/*`).
+  
+  **⚠️ Keep server-side only** - Never expose to browser
+  
+  **Location**: Supabase Dashboard → Settings → API → Service role key
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_APP_URL" type="string">
+  Canonical origin used for CSRF enforcement (`lib/security/origin.ts`) and activation links.
+  
+  **Recommended** for production deployments to ensure magic links and same-origin checks work correctly.
+  
+  **Example**: `https://umbra.concrete-security.com`
+</ParamField>
+
+<ParamField path="FORM_TOKEN_SECRET" type="string" required>
+  HMAC key for signed form tokens used by waitlist and feedback forms. Required for `/api/form-token`.
+  
+  **Generate with**: `openssl rand -hex 32`
+  
+  Tokens expire in 10 minutes (configured in `lib/security/form-token.ts`).
+</ParamField>
+
+## Confidential Provider Defaults
+
+Optional defaults shown in the provider settings card. Users can override these in the UI.
+
+<ParamField path="NEXT_PUBLIC_VLLM_BASE_URL" type="string">
+  Default provider base URL shown in the confidential workspace provider settings.
+  
+  **Example**: `https://vllm.example.com/v1`
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_VLLM_MODEL" type="string">
+  Default model identifier shown in provider settings.
+  
+  **Example**: `meta-llama/Llama-3.1-70B-Instruct`
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_VLLM_PROVIDER_NAME" type="string">
+  Friendly provider name used in UI badges and labels.
+  
+  **Example**: `Concrete Confidential vLLM`
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_DEFAULT_SYSTEM_PROMPT" type="string">
+  Overrides the default Umbra system prompt defined in `lib/system-prompt.ts` without editing the file.
+  
+  Useful for customizing the AI persona per deployment.
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_DEFAULT_MAX_TOKENS" type="number" default="4098">
+  Default `max_tokens` parameter for model requests.
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_DEFAULT_TEMPERATURE" type="number" default="0.7">
+  Default `temperature` parameter for model requests.
+</ParamField>
+
+## RA-TLS & Attestation
+
+Configuration for Remote Attestation TLS connections to TEE-hosted LLMs.
+
+<ParamField path="NEXT_PUBLIC_RATLS_PROXY_URL" type="string">
+  WebSocket proxy URL for RA-TLS connections. The proxy bridges WebSocket to TCP for the TEE.
+  
+  **Required for live attestation** - Without this, RA-TLS connections will fail
+  
+  **Example**: `wss://proxy.example.com`
+  
+  **Security**: The proxy enforces an allowlist (`RATLS_PROXY_ALLOWLIST`) to prevent SSRF. All targets must be explicitly authorized.
+</ParamField>
+
+<ParamField path="NEXT_PUBLIC_ATTESTATION_TEST_MODE" type="boolean" default="false">
+  When `true`, skips real attestation verification. Used by Playwright E2E tests.
+  
+  **⚠️ Never enable in production** - This bypasses critical security verification
+  
+  **Usage**: `NEXT_PUBLIC_ATTESTATION_TEST_MODE=true pnpm test:e2e`
+</ParamField>
+
+## Email & Feedback
+
+Configuration for Resend email delivery.
+
+<ParamField path="RESEND_API_KEY" type="string">
+  API key for Resend email service. Used by `lib/email/resend.ts`.
+  
+  **Required to send mail** - Without this, emails are skipped (logged in development)
+  
+  **Location**: [Resend Dashboard](https://resend.com/api-keys)
+</ParamField>
+
+<ParamField path="RESEND_FROM_EMAIL" type="string" default="Concrete Security <onboarding@resend.dev>">
+  Email sender address for waitlist activation and feedback emails.
+  
+  Must be a verified domain in Resend.
+</ParamField>
+
+<ParamField path="RESEND_TO_EMAIL_FEEDBACK" type="string" required="if /api/feedback is enabled">
+  Destination inbox for feedback submissions.
+  
+  **Example**: `feedback@concrete-security.com`
+</ParamField>
+
+## Runtime Toggles
+
+Feature flags for runtime behavior.
+
+<ParamField path="NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS" type="boolean" default="false">
+  When `true`, anonymous visitors are limited to a single confidential workspace session before sign-in is required.
+  
+  Authenticated users (with `member` or `admin` role) are exempt from this limit.
+</ParamField>
+
+## Environment Variable Groups
+
+### Minimal Development Setup
+
+Minimum variables needed for local development:
+
+```bash
+# Supabase (required)
+NEXT_PUBLIC_SUPABASE_URL=https://xxxxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGc...
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGc...
+
+# Form security (required)
+FORM_TOKEN_SECRET=your-secret-from-openssl-rand
+```
+
+### Full Production Setup
+
+Complete configuration for production deployment:
+
+```bash
+# Core auth & origin
+NEXT_PUBLIC_SUPABASE_URL=https://xxxxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGc...
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGc...
+NEXT_PUBLIC_APP_URL=https://umbra.concrete-security.com
+FORM_TOKEN_SECRET=your-secret-from-openssl-rand
+
+# Provider defaults
+NEXT_PUBLIC_VLLM_BASE_URL=https://vllm.example.com/v1
+NEXT_PUBLIC_VLLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+NEXT_PUBLIC_VLLM_PROVIDER_NAME=Concrete Confidential vLLM
+
+# RA-TLS
+NEXT_PUBLIC_RATLS_PROXY_URL=wss://proxy.example.com
+
+# Email
+RESEND_API_KEY=re_xxxxx
+RESEND_FROM_EMAIL=Concrete Security <no-reply@concrete-security.com>
+RESEND_TO_EMAIL_FEEDBACK=feedback@concrete-security.com
+
+# Runtime toggles
+NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS=true
+```
+
+## Deployment Checklist
+
+When deploying to production:
+
+1. ✅ Set all required environment variables in hosting provider
+2. ✅ Ensure `NEXT_PUBLIC_APP_URL` matches production origin for CSRF checks
+3. ✅ Confirm RA-TLS proxy is accessible and TEE target is in allowlist
+4. ✅ Populate provider defaults so first-time visitors see sensible values
+5. ✅ Verify Resend domain is configured and `RESEND_FROM_EMAIL` is valid
+6. ✅ Test magic link emails arrive at correct callback URL
+7. ✅ Never enable `NEXT_PUBLIC_ATTESTATION_TEST_MODE` in production
+
+## Security Notes
+
+- **Never commit** `.env.local` to version control
+- **Service role key** should only be available to server-side code
+- **Form token secret** should be cryptographically random (min 32 bytes)
+- **Reset** `.env.local` when switching between staging/prod to keep Playwright and Supabase sessions deterministic

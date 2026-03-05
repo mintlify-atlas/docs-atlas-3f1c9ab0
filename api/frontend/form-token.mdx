@@ -1,0 +1,144 @@
+---
+title: "Get Form Token"
+api: "GET /api/form-token"
+---
+
+# Get Form Token
+
+Obtain an HMAC-signed form token for submitting protected forms (waitlist, feedback).
+
+## Endpoint
+
+```
+GET /api/form-token
+```
+
+## Authentication
+
+No authentication required, but must be same-origin request.
+
+## Security Requirements
+
+- Must be same-origin request (checked via `Origin` header)
+
+## Response
+
+<ResponseField name="token" type="string" required>
+  HMAC-signed form token. Format: `{nonce}.{timestamp}.{signature}`
+  
+  - `nonce`: 32-character hex string (16 bytes of randomness)
+  - `timestamp`: Unix timestamp in milliseconds
+  - `signature`: 64-character HMAC-SHA256 signature
+</ResponseField>
+
+## Token Expiry
+
+Tokens are valid for **10 minutes** from issuance. After expiry, requests using the token will be rejected with a 400 error.
+
+## Error Responses
+
+### 403 Forbidden
+
+- Cross-origin request blocked
+
+### 500 Internal Server Error
+
+- `FORM_TOKEN_SECRET` environment variable not configured
+- Token generation failed
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl https://umbra.concrete-security.com/api/form-token \
+  -H "Origin: https://umbra.concrete-security.com"
+```
+
+```typescript TypeScript
+const response = await fetch("/api/form-token");
+const data = await response.json();
+
+console.log("Token:", data.token);
+// Use this token in subsequent form submissions
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    "https://umbra.concrete-security.com/api/form-token",
+    headers={"Origin": "https://umbra.concrete-security.com"},
+)
+
+token = response.json()["token"]
+print(f"Token: {token}")
+# Use this token in subsequent form submissions
+```
+
+</CodeGroup>
+
+### Success Response
+
+```json
+{
+  "token": "a1b2c3d4e5f67890123456789abcdef0.1709654400000.8f3a2b1c4d5e6f7890123456789abcdef01234567890abcdef1234567890abcd"
+}
+```
+
+### Error Response
+
+```json
+{
+  "error": "Unable to issue a form token. Please try again later."
+}
+```
+
+## Token Verification
+
+When a form is submitted with a token, the server verifies:
+
+1. **Format**: Token must have exactly 3 parts separated by dots
+2. **Completeness**: All parts (nonce, timestamp, signature) must be present
+3. **Timestamp**: Must be a valid number
+4. **Expiry**: Token must not be older than 10 minutes
+5. **Signature**: HMAC-SHA256 signature must match using `FORM_TOKEN_SECRET`
+
+Verification uses constant-time comparison to prevent timing attacks.
+
+## Token Structure
+
+```
+{nonce}.{timestamp}.{signature}
+```
+
+Example breakdown:
+- **Nonce**: `a1b2c3d4e5f67890123456789abcdef0` (32 hex chars)
+- **Timestamp**: `1709654400000` (milliseconds since epoch)
+- **Signature**: `8f3a2b1c4d5e6f7890123456789abcdef01234567890abcdef1234567890abcd` (64 hex chars)
+
+The signature is computed as:
+```
+HMAC-SHA256(nonce + "." + timestamp, FORM_TOKEN_SECRET)
+```
+
+## Implementation Details
+
+<Note>
+Form tokens provide anti-bot protection without requiring CAPTCHA. They ensure requests originate from the legitimate frontend and not from automated scripts.
+</Note>
+
+<Warning>
+The `FORM_TOKEN_SECRET` environment variable must be configured and kept secure. It's used to sign and verify all form tokens.
+</Warning>
+
+## Usage Pattern
+
+1. **Frontend**: Request token from `/api/form-token`
+2. **Frontend**: Include token in form submission to `/api/waitlist` or `/api/feedback`
+3. **Backend**: Verify token signature and expiry
+4. **Backend**: Process form if valid, reject if invalid/expired
+
+Tokens are single-use in practice due to the short expiry window and rate limiting on form submission endpoints.
+
+Source: `frontend/app/api/form-token/route.ts` and `frontend/lib/security/form-token.ts`

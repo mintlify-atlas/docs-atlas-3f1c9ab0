@@ -1,0 +1,494 @@
+---
+title: Auth Service
+description: Lightweight HTTP server providing token-based authentication for protected endpoints
+---
+
+## Overview
+
+The auth service is a minimal HTTP server that validates Bearer tokens for protected endpoints. It integrates with nginx's `auth_request` module to provide authentication without adding dependencies to the reverse proxy.
+
+## Architecture
+
+### Technology Stack
+
+- **Language**: Python 3.10+
+- **Server**: `http.server.HTTPServer` (standard library)
+- **Dependencies**: None (zero external dependencies)
+- **Package Manager**: uv for development tools only
+
+### Design Philosophy
+
+The auth service follows a minimalist design:
+
+- **No Framework**: Uses Python standard library HTTP server
+- **No Database**: Tokens validated against environment variable
+- **Ephemeral**: Salted hashes regenerated on each restart
+- **Fast**: Constant-time comparison prevents timing attacks
+
+### Service Configuration
+
+```yaml
+auth-service:
+  image: ghcr.io/concrete-security/auth-service
+  container_name: auth-service
+  environment:
+    - HOST=0.0.0.0
+    - PORT=8081
+    - AUTH_SERVICE_TOKEN=${AUTH_SERVICE_TOKEN}
+    - LOG_LEVEL=INFO
+  expose:
+    - "8081"
+  networks:
+    - auth
+```
+
+## API Endpoints
+
+### Health Check
+
+```http
+GET /health
+```
+
+**Response**:
+
+```
+200 OK
+Content-Type: text/plain
+
+healthy
+```
+
+### Authentication Validation
+
+```http
+GET /auth
+Authorization: Bearer <token>
+```
+
+**Success Response**:
+
+```
+200 OK
+```
+
+**Failure Response**:
+
+```
+401 Unauthorized
+WWW-Authenticate: Bearer
+```
+
+## Token-Based Authentication
+
+### Token Configuration
+
+Configure the valid token via environment variable:
+
+```bash
+export AUTH_SERVICE_TOKEN="your-secure-token-here"
+```
+
+<Warning>
+The token must be at least 32 characters. Shorter tokens will cause all authentication requests to fail.
+</Warning>
+
+### Token Hashing
+
+The service hashes tokens with a random salt generated at startup:
+
+```python
+# Random salt generated at startup
+AUTH_SALT = secrets.token_bytes(32)
+
+def hash_token(token: str) -> bytes:
+    """Hash a token with the application salt using SHA-256."""
+    return hashlib.sha256(AUTH_SALT + token.encode()).digest()
+
+# Hash the configured token at startup
+AUTH_SERVICE_TOKEN_HASH = (
+    hash_token(os.environ.get("AUTH_SERVICE_TOKEN"))
+    if AUTH_SERVICE_TOKEN_LEN >= MIN_AUTH_SERVICE_TOKEN_LEN
+    else None
+)
+```
+
+From `main.py:17-36`
+
+**Properties**:
+
+- **Ephemeral**: Salt is not persisted; tokens only valid for process lifetime
+- **Memory Safety**: Token hashes stored in memory, not plain text
+- **Fast Comparison**: Pre-computed hash enables efficient validation
+
+### Token Validation
+
+Tokens are validated using constant-time comparison:
+
+```python
+def token_match(token: str, expected_hash: bytes) -> bool:
+    """Hash token and compare to expected hash in constant time."""
+    provided_hash = hash_token(token)
+    return secrets.compare_digest(provided_hash, expected_hash)
+```
+
+From `main.py:39-43`
+
+<Note>
+Constant-time comparison using `secrets.compare_digest()` prevents timing attacks where attackers could infer token correctness from response timing.
+</Note>
+
+## HTTP Server Implementation
+
+### Request Handler
+
+The service implements a minimal HTTP request handler:
+
+```python
+class AuthHandler(BaseHTTPRequestHandler):
+    # Maximum allowed header size (8KB) and request line size (8KB)
+    MAX_REQUEST_LINE = 8192
+    MAX_HEADERS = 8192
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"healthy")
+            return
+
+        if self.path == "/auth":
+            auth_header = self.headers.get("Authorization", "")
+            
+            if not AUTH_SERVICE_TOKEN_HASH:
+                logger.error("AUTH_SERVICE_TOKEN not set")
+                self.send_response(500)
+                self.end_headers()
+                return
+
+            match = re.match(r"^Bearer\s+(.+)", auth_header)
+            token = match.group(1) if match else ""
+            if token_match(token, AUTH_SERVICE_TOKEN_HASH):
+                logger.debug("Authentication successful")
+                self.send_response(200)
+                self.end_headers()
+            else:
+                logger.warning("Authentication failed")
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+```
+
+From `main.py:71-102`
+
+### Request Size Limits
+
+The service enforces strict size limits to prevent abuse:
+
+```python
+def parse_request(self):
+    """Override to enforce request size limits."""
+    if not super().parse_request():
+        return False
+
+    # Check request line length
+    if len(self.raw_requestline) > self.MAX_REQUEST_LINE:
+        self.send_error(414, "Request-URI Too Long")
+        return False
+
+    # Check total headers size
+    headers_size = sum(len(k) + len(v) for k, v in self.headers.items())
+    if headers_size > self.MAX_HEADERS:
+        self.send_error(431, "Request Header Fields Too Large")
+        return False
+
+    return True
+```
+
+From `main.py:54-70`
+
+## Nginx Integration
+
+### auth_request Module
+
+The auth service integrates with nginx's `auth_request` module:
+
+```nginx
+# Internal auth subrequest endpoint
+location = /_auth {
+    internal;
+    proxy_pass http://auth-service:8081/auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+    # Forward the Authorization header with the Bearer token
+    proxy_set_header Authorization $http_authorization;
+}
+
+# Protected endpoint
+location = /metrics {
+    auth_request /_auth;
+    
+    # ... proxy to backend service ...
+    proxy_pass http://vllm_backend;
+}
+```
+
+From nginx configuration
+
+### Authentication Flow
+
+```
+┌─────────┐              ┌─────────┐              ┌──────────────┐
+│ Client  │              │  Nginx  │              │ Auth Service │
+└────┬────┘              └────┬────┘              └──────┬───────┘
+     │                        │                          │
+     │ 1. GET /metrics        │                          │
+     │    Authorization:      │                          │
+     │    Bearer <token>      │                          │
+     │───────────────────────>│                          │
+     │                        │                          │
+     │                        │ 2. Subrequest:           │
+     │                        │    GET /_auth            │
+     │                        │    Authorization: Bearer │
+     │                        │───────────────────────────>│
+     │                        │                          │
+     │                        │                          │ 3. Validate
+     │                        │                          │    token
+     │                        │                          │
+     │                        │ 4a. 200 OK (if valid)    │
+     │                        │<───────────────────────────│
+     │                        │                          │
+     │ 5a. Proxy to backend   │                          │
+     │<───────────────────────│                          │
+     │                        │                          │
+     │                        │ 4b. 401 (if invalid)     │
+     │                        │<───────────────────────────│
+     │                        │                          │
+     │ 5b. 401 Unauthorized   │                          │
+     │<───────────────────────│                          │
+     │                        │                          │
+```
+
+## Development and Testing
+
+### Running Locally
+
+```bash
+cd auth-service
+
+# Set environment variables
+export AUTH_SERVICE_TOKEN="my-development-token-32-chars-min"
+export HOST="127.0.0.1"
+export PORT="8081"
+export LOG_LEVEL="DEBUG"
+
+# Install development dependencies
+uv sync
+
+# Run the service
+uv run python -m auth_service.main
+```
+
+### Testing Authentication
+
+```bash
+# Health check
+curl http://localhost:8081/health
+
+# Valid token
+curl -H "Authorization: Bearer my-development-token-32-chars-min" \
+     http://localhost:8081/auth
+# Expected: 200 OK
+
+# Invalid token
+curl -H "Authorization: Bearer wrong-token" \
+     http://localhost:8081/auth
+# Expected: 401 Unauthorized
+
+# Missing Authorization header
+curl http://localhost:8081/auth
+# Expected: 401 Unauthorized
+```
+
+## Docker Image
+
+### Dockerfile
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY src/auth_service/ ./auth_service/
+
+CMD ["python", "-m", "auth_service.main"]
+```
+
+### Published Images
+
+Images are published to GitHub Container Registry:
+
+```yaml
+image: ghcr.io/concrete-security/auth-service@sha256:f819c57d...
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `8081` | Service port |
+| `AUTH_SERVICE_TOKEN` | - | Valid Bearer token (required, min 32 chars) |
+| `MIN_AUTH_SERVICE_TOKEN_LEN` | `32` | Minimum token length |
+| `LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG, INFO, WARNING, ERROR) |
+
+## Security Considerations
+
+### Token Security
+
+<Warning>
+Generate cryptographically secure tokens using:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Never use predictable or short tokens in production.
+</Warning>
+
+### Threat Protection
+
+The service protects against:
+
+- **Timing Attacks**: Constant-time token comparison
+- **Memory Exposure**: Token stored as salted hash
+- **Request Flooding**: Size limits on requests and headers
+- **Brute Force**: Consider rate limiting at nginx level
+
+### Network Isolation
+
+The auth service should never be exposed externally:
+
+```yaml
+expose:    # Internal only
+  - "8081"
+# NOT:
+ports:     # Never expose externally!
+  - "8081:8081"
+```
+
+### Token Rotation
+
+Since tokens are ephemeral (salt changes on restart):
+
+1. Update `AUTH_SERVICE_TOKEN` environment variable
+2. Restart the auth service
+3. All existing tokens immediately invalidated
+4. New token takes effect
+
+<Note>
+For zero-downtime rotation, use container orchestration to start new instance before stopping old one.
+</Note>
+
+## Logging
+
+The service logs authentication events:
+
+```python
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("auth-service")
+```
+
+**Log Messages**:
+
+- `INFO`: Service startup, successful authentication (debug level)
+- `WARNING`: Authentication failures
+- `ERROR`: Missing or invalid configuration
+
+## Monitoring
+
+Key metrics to track:
+
+- Authentication success rate
+- Authentication failure rate (may indicate attacks)
+- Request latency to `/auth` endpoint
+- Service health check status
+
+## Limitations
+
+### Single Token
+
+The service only supports a single global token:
+
+- No per-user tokens
+- No token scopes or permissions
+- No token expiration beyond process lifetime
+
+For multi-tenant or complex authentication, consider:
+
+- JWT-based authentication
+- OAuth2/OIDC integration
+- Database-backed token storage
+
+### Stateless Design
+
+The ephemeral salt design means:
+
+- Tokens invalidated on service restart
+- No token revocation without restart
+- No distributed token validation
+
+This is acceptable for single-instance deployments protecting administrative endpoints like `/metrics`.
+
+## Best Practices
+
+### Token Management
+
+1. Generate tokens with sufficient entropy (32+ bytes)
+2. Store tokens in secrets management (e.g., GitHub Secrets, Vault)
+3. Never commit tokens to version control
+4. Rotate tokens periodically
+5. Use different tokens for staging and production
+
+### Deployment
+
+1. Never expose port 8081 externally
+2. Use Docker secrets or environment variable injection
+3. Monitor authentication failure rates
+4. Set appropriate `LOG_LEVEL` for environment
+5. Ensure nginx health checks validate auth service
+
+### Error Handling
+
+```python
+if not AUTH_SERVICE_TOKEN_HASH:
+    logger.warning(
+        "AUTH_SERVICE_TOKEN not set or too short "
+        f"(min is {MIN_AUTH_SERVICE_TOKEN_LEN}) - "
+        "all auth requests will fail"
+    )
+```
+
+From `main.py:108-112`
+
+The service starts even without a valid token, but all authentication requests will fail. This allows the container to start while providing clear error messages.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Certificate Manager" icon="certificate" href="/cvm/cert-manager">
+    Configure TLS certificates and nginx
+  </Card>
+  <Card title="Deployment Guide" icon="rocket" href="/cvm/deployment">
+    Deploy services to production
+  </Card>
+</CardGroup>

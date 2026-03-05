@@ -1,0 +1,551 @@
+---
+title: "Authentication System"
+description: "Supabase-powered authentication with waitlist flow, magic links, and role-based access control"
+---
+
+Umbra uses Supabase for authentication and user management, providing email/password sign-in, magic links, and role-based access control.
+
+## Overview
+
+The authentication system integrates Supabase Auth with Next.js 15's app router, providing:
+
+- **Email/password authentication** for returning users
+- **Magic link activation** for waitlist approvals
+- **Role-based access control** (admin, member, guest)
+- **Server-side session management** via middleware
+- **Client-side state synchronization** via `SupabaseAuthListener`
+
+<Note>
+  All authentication logic uses Supabase's server-side rendering (SSR) package (`@supabase/ssr`) to maintain consistent auth state between server components, client components, and middleware.
+</Note>
+
+## Supabase Integration
+
+Umbra initializes Supabase clients for different contexts:
+
+### Client Contexts
+
+<CardGroup cols={2}>
+  <Card title="Browser Client" icon="browser">
+    Client-side auth for React components. Initialized with public anon key.
+  </Card>
+  
+  <Card title="Server Components" icon="server">
+    Server-side auth for React Server Components. Uses cookies for sessions.
+  </Card>
+  
+  <Card title="Route Handlers" icon="route">
+    API route auth for Next.js route handlers. Manages session cookies.
+  </Card>
+  
+  <Card title="Service Role" icon="key">
+    Admin client with full database access. Used for waitlist management.
+  </Card>
+</CardGroup>
+
+### Client Initialization
+
+**Browser client:**
+
+```typescript:frontend/lib/supabase/client.ts
+import { createBrowserClient } from '@supabase/ssr'
+import type { Database } from './types'
+
+export function createSupabaseBrowserClient() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase environment variables')
+  }
+  
+  return createBrowserClient<Database>(supabaseUrl, supabaseKey)
+}
+```
+
+**Route handler client:**
+
+```typescript:frontend/lib/supabase/route-handler.ts
+import { createServerClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+
+export async function createSupabaseRouteHandlerClient() {
+  const cookieStore = await cookies()
+  
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name) {
+          return cookieStore.get(name)?.value
+        },
+        set(name, value, options) {
+          cookieStore.set(name, value, options)
+        },
+        remove(name, options) {
+          cookieStore.delete(name)
+        },
+      },
+    }
+  )
+}
+```
+
+## Waitlist Flow
+
+Umbra uses a waitlist system to control access during beta:
+
+<Steps>
+  <Step title="Waitlist Request">
+    User submits email, company, and use case through `/sign-in` or landing page waitlist form. Request is stored in the `waitlist_requests` table with status `requested`.
+  </Step>
+  
+  <Step title="Admin Review">
+    Admin views request in `/admin/waitlist` console, adds notes, and sets priority/status.
+  </Step>
+  
+  <Step title="Activation">
+    Admin clicks "Send Invitation" to generate a magic link and send branded email via Resend. Status changes to `invited`.
+  </Step>
+  
+  <Step title="Email Verification">
+    User clicks magic link, which confirms their email and triggers the activation trigger.
+  </Step>
+  
+  <Step title="Auto-Promotion">
+    Database trigger promotes user to `member` role and updates waitlist status to `activated`.
+  </Step>
+</Steps>
+
+### Waitlist Request Storage
+
+Waitlist entries are stored in PostgreSQL:
+
+```sql:frontend/supabase/schema.sql
+create type public.waitlist_status as enum (
+  'requested',   -- Initial submission
+  'contacted',   -- Admin reached out manually
+  'invited',     -- Magic link sent
+  'activated',   -- User verified email
+  'archived'     -- Closed/declined
+);
+
+create table public.waitlist_requests (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default timezone('utc', now()),
+  email citext not null unique,
+  company text,
+  use_case text,
+  status public.waitlist_status not null default 'requested',
+  notes text,  -- Admin notes
+  priority integer,  -- Admin priority
+  last_contacted_at timestamptz,
+  supabase_user_id uuid references auth.users (id) on delete set null,
+  activation_sent_at timestamptz,
+  activation_link text,
+  activated_at timestamptz,
+  metadata jsonb
+);
+```
+
+### Activation Trigger
+
+The `handle_waitlist_activation()` trigger automatically promotes users:
+
+```sql:frontend/supabase/schema.sql
+create or replace function public.handle_waitlist_activation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  waitlist_entry public.waitlist_requests%rowtype;
+  merged_roles jsonb;
+  app_meta jsonb;
+  user_meta jsonb;
+begin
+  -- Only fire when email is confirmed
+  if NEW.email_confirmed_at is null then
+    return NEW;
+  end if;
+
+  -- Find matching waitlist entry with status 'invited'
+  select * into waitlist_entry
+    from public.waitlist_requests
+   where email = NEW.email::citext
+     and status = 'invited'
+   limit 1;
+
+  if not found then
+    return NEW;
+  end if;
+
+  -- Update waitlist status to 'activated'
+  update public.waitlist_requests
+     set status = 'activated',
+         supabase_user_id = NEW.id,
+         activated_at = coalesce(activated_at, timezone('utc', now()))
+   where id = waitlist_entry.id;
+
+  -- Add 'member' role to user metadata
+  app_meta := coalesce(NEW.raw_app_meta_data, '{}'::jsonb);
+  merged_roles := (
+    select coalesce(jsonb_agg(role order by role), jsonb_build_array('member'))
+    from (
+      select distinct role
+      from (
+        select jsonb_array_elements_text(coalesce(app_meta->'roles', '[]'::jsonb)) as role
+        union all
+        select 'member'
+      ) roles
+    ) distinct_roles
+  );
+  app_meta := jsonb_set(app_meta, '{roles}', merged_roles, true);
+  NEW.raw_app_meta_data := app_meta;
+
+  return NEW;
+end;
+$$;
+```
+
+## Magic Link Activation
+
+Magic links provide passwordless authentication for waitlist users:
+
+### Magic Link Generation
+
+The `/api/admin/waitlist/[id]/activate` endpoint generates magic links:
+
+```typescript:frontend/app/api/admin/waitlist/[id]/activate/route.ts
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  // Verify admin role
+  const supabase = await createSupabaseRouteHandlerClient()
+  await requireAdminUser(supabase)
+
+  // Load waitlist entry
+  const serviceRole = createSupabaseServiceRoleClient()
+  const { data: entry } = await serviceRole
+    .from("waitlist_requests")
+    .select("*")
+    .eq("id", entryId)
+    .maybeSingle()
+
+  // Generate magic link
+  const appUrl = resolveAppUrl(request)
+  const redirectTo = `${appUrl}/sign-in?redirect=/confidential-ai`
+
+  const { data: linkData } = await serviceRole.auth.admin.generateLink({
+    type: "magiclink",
+    email: entry.email,
+    options: {
+      redirectTo,
+      data: {
+        waitlist_request_id: entry.id,
+        company: entry.company ?? undefined,
+        use_case: entry.use_case ?? undefined,
+      },
+    },
+  })
+
+  const magicLink = linkData?.properties?.action_link
+
+  // Send email via Resend
+  await sendWaitlistActivationEmail({
+    email: entry.email,
+    magicLink,
+    company: entry.company,
+    useCase: entry.use_case,
+  })
+
+  // Update waitlist entry
+  await serviceRole
+    .from("waitlist_requests")
+    .update({
+      status: "invited",
+      activation_sent_at: new Date().toISOString(),
+      activation_link: magicLink,
+    })
+    .eq("id", entryId)
+
+  return NextResponse.json({ success: true })
+}
+```
+
+### Email Template
+
+Activation emails are sent via Resend using branded HTML templates:
+
+```typescript:frontend/lib/email/templates/waitlist-activation.ts
+import { Resend } from 'resend'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+export async function sendWaitlistActivationEmail({
+  email,
+  magicLink,
+  company,
+  useCase,
+}: {
+  email: string
+  magicLink: string
+  company?: string | null
+  useCase?: string | null
+}) {
+  const subject = 'Welcome to Umbra - Your Access is Ready'
+  
+  const htmlBody = `
+    <h1>Welcome to Umbra</h1>
+    <p>Your access to Umbra's confidential AI workspace has been approved.</p>
+    <p><a href="${magicLink}">Click here to activate your account</a></p>
+    ${company ? `<p>Company: ${company}</p>` : ''}
+    ${useCase ? `<p>Use case: ${useCase}</p>` : ''}
+  `
+  
+  const textBody = `
+    Welcome to Umbra
+    
+    Your access has been approved. Activate your account:
+    ${magicLink}
+  `
+
+  await resend.emails.send({
+    from: process.env.RESEND_FROM_EMAIL ?? 'Concrete Security <onboarding@resend.dev>',
+    to: email,
+    subject,
+    html: htmlBody,
+    text: textBody,
+  })
+}
+```
+
+## Role-Based Access Control
+
+Umbra uses roles stored in Supabase user metadata:
+
+### Role Types
+
+| Role | Access |
+|------|--------|
+| `admin` | Full access to admin console, waitlist management, and all features |
+| `member` | Access to confidential workspace without guest restrictions |
+| _(none)_ | Guest access with optional throttling if `NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS=true` |
+
+### Role Storage
+
+Roles are stored in `auth.users.raw_app_meta_data`:
+
+```sql
+update auth.users
+set raw_app_meta_data = jsonb_set(
+  coalesce(raw_app_meta_data, '{}'),
+  '{roles}',
+  '["admin"]'::jsonb,
+  true
+)
+where email = 'admin@example.com';
+```
+
+### Role Checking
+
+The `requireAdminUser()` helper enforces admin access:
+
+```typescript:frontend/lib/auth.ts
+import type { SupabaseClient, User } from "@supabase/supabase-js"
+import { isAuthSessionMissingError } from "@/lib/supabase/errors"
+
+export async function requireAdminUser(client: SupabaseClient): Promise<User> {
+  const { data, error } = await client.auth.getUser()
+
+  if (error || !data?.user) {
+    if (isAuthSessionMissingError(error)) {
+      throw new AuthenticatedAccessError("Authentication required", 401)
+    }
+    throw new AuthenticatedAccessError(error?.message ?? "Unauthorized", 403)
+  }
+
+  const roles = (data.user.app_metadata?.roles as string[] | undefined) ?? []
+  if (!roles.includes("admin")) {
+    throw new AuthenticatedAccessError("Administrator role required", 403)
+  }
+
+  return data.user
+}
+```
+
+Admin routes use this helper:
+
+```typescript:frontend/app/api/admin/waitlist/route.ts
+export async function GET(request: Request) {
+  const supabase = await createSupabaseRouteHandlerClient()
+  
+  try {
+    await requireAdminUser(supabase)
+  } catch (error) {
+    if (error instanceof AuthenticatedAccessError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
+    throw error
+  }
+  
+  // Admin logic here...
+}
+```
+
+## Guest Throttling
+
+Optional guest throttling limits anonymous usage:
+
+### Configuration
+
+```bash
+NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS=true
+```
+
+### Implementation
+
+```typescript:frontend/app/confidential-ai/page.tsx
+const GUEST_USAGE_STORAGE_KEY = "confidential-chat-guest-used"
+const GUEST_ACTIVE_SESSION_KEY = "confidential-chat-guest-active"
+const GUEST_LIMITS_ENABLED = process.env.NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS === "true"
+
+useEffect(() => {
+  if (!GUEST_LIMITS_ENABLED || authState !== "signed-out") {
+    setGuestUsageRestricted(false)
+    return
+  }
+
+  const alreadyUsed = localStorage.getItem(GUEST_USAGE_STORAGE_KEY)
+  const activeSession = sessionStorage.getItem(GUEST_ACTIVE_SESSION_KEY)
+  const locked = Boolean(alreadyUsed && !activeSession)
+  
+  setGuestUsageRestricted(locked)
+  setGuestNotice(
+    locked ? "You've already used your guest session. Sign in to continue." : null
+  )
+}, [authState])
+```
+
+<Note>
+  Guest throttling only applies when Supabase is configured and `NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS=true`. If Supabase is unavailable, guests have unlimited access.
+</Note>
+
+## Middleware and Session Management
+
+The `middleware.ts` file refreshes Supabase sessions on every request:
+
+```typescript:frontend/middleware.ts
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+
+export async function middleware(request: NextRequest) {
+  const response = NextResponse.next()
+  
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name) {
+          return request.cookies.get(name)?.value
+        },
+        set(name, value, options) {
+          response.cookies.set(name, value, options)
+        },
+        remove(name, options) {
+          response.cookies.delete(name)
+        },
+      },
+    }
+  )
+  
+  // Refresh session
+  await supabase.auth.getUser()
+  
+  return response
+}
+```
+
+The `SupabaseAuthListener` component keeps client state synchronized:
+
+```typescript:frontend/components/supabase-auth-listener.tsx
+export function SupabaseAuthListener() {
+  const supabase = createSupabaseBrowserClient()
+  
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        // Post to /auth/callback to sync server state
+        fetch('/auth/callback', {
+          method: 'POST',
+          body: JSON.stringify({ event, session }),
+        })
+      }
+    )
+    
+    return () => subscription.unsubscribe()
+  }, [supabase])
+  
+  return null
+}
+```
+
+## Configuration Reference
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes | Public anon key for client-side auth |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | Service role key for admin operations |
+| `NEXT_PUBLIC_APP_URL` | Recommended | Canonical origin for magic links |
+| `RESEND_API_KEY` | Yes | Resend API key for email delivery |
+| `RESEND_FROM_EMAIL` | Optional | Override sender email |
+| `NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS` | Optional | Enable guest throttling |
+
+### Supabase Setup
+
+<Steps>
+  <Step title="Create Project">
+    Create a Supabase project at https://supabase.com
+  </Step>
+  
+  <Step title="Configure URLs">
+    Add callback URLs in **Authentication → URL Configuration**:
+    - `http://localhost:3000/auth/callback` (dev)
+    - `https://yourdomain.com/auth/callback` (prod)
+  </Step>
+  
+  <Step title="Run Schema">
+    Execute `supabase/schema.sql` in the SQL editor to create `waitlist_requests` table and trigger.
+  </Step>
+  
+  <Step title="Create Admin User">
+    Manually promote a user to admin:
+    ```sql
+    update auth.users
+    set raw_app_meta_data = jsonb_set(
+      coalesce(raw_app_meta_data, '{}'),
+      '{roles}',
+      '["admin"]'::jsonb,
+      true
+    )
+    where email = 'admin@example.com';
+    ```
+  </Step>
+</Steps>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Admin Console" href="/features/admin-console" icon="users-gear">
+    Learn how to manage waitlist requests and activate users
+  </Card>
+  
+  <Card title="Confidential Workspace" href="/features/confidential-workspace" icon="lock">
+    Understand how authentication integrates with the workspace
+  </Card>
+</CardGroup>

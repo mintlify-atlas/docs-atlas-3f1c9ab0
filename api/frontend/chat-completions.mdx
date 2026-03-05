@@ -1,0 +1,286 @@
+---
+title: "Chat Completions"
+api: "POST /v1/chat/completions"
+---
+
+# Chat Completions
+
+OpenAI-compatible chat completions endpoint for confidential AI inference. This endpoint is **not** exposed by the Umbra frontend server—instead, the frontend connects directly to the provider (vLLM) inside the TEE using authenticated TLS (aTLS) with attestation verification.
+
+<Note>
+This is **not** a Next.js API route. The frontend uses the `confidential-chat.ts` library to connect directly to the provider endpoint inside the TEE.
+</Note>
+
+## Endpoint
+
+```
+POST {NEXT_PUBLIC_VLLM_BASE_URL}/v1/chat/completions
+```
+
+The base URL is configured via the `NEXT_PUBLIC_VLLM_BASE_URL` environment variable or provided by the user in the UI.
+
+## Authentication
+
+<Warning>
+Requires Bearer token authentication if the provider requires it. Token is passed via the `Authorization` header.
+</Warning>
+
+The aTLS connection is established using the [@phala/dcap-qvl-web](https://github.com/Phala-Network/dcap-qvl-web) library, which verifies Intel TDX attestation quotes in-browser.
+
+## Security Requirements
+
+- Must use HTTPS (except for localhost/127.0.0.1 in development)
+- TDX attestation verification via aTLS
+- EKM channel binding to prevent MITM attacks
+
+## Request Parameters
+
+<ParamField path="model" type="string" required>
+  Model identifier (e.g., "Qwen/Qwen2.5-32B-Instruct"). Configured via `NEXT_PUBLIC_VLLM_MODEL` or user settings.
+</ParamField>
+
+<ParamField path="messages" type="array" required>
+  Array of message objects with `role` ("system", "user", or "assistant") and `content` (string).
+</ParamField>
+
+<ParamField path="temperature" type="number" optional>
+  Sampling temperature (0.0 to 2.0). Defaults to 0.7.
+</ParamField>
+
+<ParamField path="max_tokens" type="number" optional>
+  Maximum tokens to generate. Defaults to 4098.
+</ParamField>
+
+<ParamField path="stream" type="boolean" optional>
+  Enable streaming responses. Defaults to true.
+</ParamField>
+
+<ParamField path="reasoning_effort" type="string" optional>
+  Reasoning effort level: "low", "medium", or "high". For models that support reasoning.
+</ParamField>
+
+<ParamField path="cache_salt" type="string" optional>
+  Cache salt for request deduplication (provider-specific).
+</ParamField>
+
+## Request Body
+
+```json
+{
+  "model": "Qwen/Qwen2.5-32B-Instruct",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "What is Intel TDX?"
+    }
+  ],
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "stream": true
+}
+```
+
+## Response (Non-Streaming)
+
+<ResponseField name="id" type="string" optional>
+  Completion ID
+</ResponseField>
+
+<ResponseField name="choices" type="array" required>
+  Array of completion choices. Each choice contains:
+  - `message`: Object with `role` and `content`
+  - `finish_reason`: Reason for completion ("stop", "length", etc.)
+</ResponseField>
+
+### Non-Streaming Response Example
+
+```json
+{
+  "id": "cmpl-123456",
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Intel TDX (Trust Domain Extensions) is a confidential computing technology..."
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+## Response (Streaming)
+
+When `stream: true`, the server returns Server-Sent Events (SSE) with `data:` prefixed lines.
+
+### Streaming Format
+
+```
+data: {"choices":[{"delta":{"content":"Intel"}}]}
+data: {"choices":[{"delta":{"content":" TDX"}}]}
+data: {"choices":[{"delta":{"content":" is"}}]}
+data: [DONE]
+```
+
+Each event contains:
+- `choices[0].delta.content`: Content chunk
+- `choices[0].delta.reasoning_content`: Reasoning chunk (for models that support it)
+- `choices[0].finish_reason`: Present in final chunk before `[DONE]`
+
+## Error Responses
+
+### 400 Bad Request
+
+- Invalid request body
+- Missing required parameters
+- `max_tokens` too small or prompt too long
+
+### 401 Unauthorized
+
+- Invalid or missing API key
+
+### 503 Service Unavailable
+
+- Provider unreachable
+- Connection timeout
+- TLS/certificate error
+
+## Example
+
+<CodeGroup>
+
+```typescript TypeScript (Browser with aTLS)
+import { streamConfidentialChat } from "@/lib/confidential-chat";
+import { createAtlsFetch } from "@phala/dcap-qvl-web";
+
+// Create aTLS fetch with attestation verification
+const atlasFetch = await createAtlsFetch({
+  attestationServiceUrl: "https://your-attestation-service.com",
+  verifyQuote: true,
+});
+
+// Stream chat completions
+const stream = streamConfidentialChat(
+  {
+    messages: [
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: "What is Intel TDX?" },
+    ],
+    model: "Qwen/Qwen2.5-32B-Instruct",
+    temperature: 0.7,
+    max_tokens: 4096,
+    stream: true,
+  },
+  {
+    provider: {
+      baseUrl: "https://your-provider.com",
+      apiKey: "your-bearer-token",
+    },
+    fetchImpl: atlasFetch, // Use aTLS fetch
+  }
+);
+
+// Process stream
+for await (const chunk of stream) {
+  if (chunk.type === "delta") {
+    console.log(chunk.content);
+  } else if (chunk.type === "error") {
+    console.error("Error:", chunk.error);
+  } else if (chunk.type === "done") {
+    console.log("Complete:", chunk.content);
+    console.log("Finish reason:", chunk.finish_reason);
+  }
+}
+```
+
+```bash cURL (Direct, No Attestation)
+# Note: This bypasses attestation verification
+curl -X POST https://your-provider.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "model": "Qwen/Qwen2.5-32B-Instruct",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is Intel TDX?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "stream": false
+  }'
+```
+
+```python Python (Direct, No Attestation)
+import requests
+
+# Note: This bypasses attestation verification
+response = requests.post(
+    "https://your-provider.com/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-32B-Instruct",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is Intel TDX?"},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "stream": False,
+    },
+    headers={"Authorization": "Bearer your-token"},
+)
+
+data = response.json()
+print(data["choices"][0]["message"]["content"])
+```
+
+</CodeGroup>
+
+## Message Validation
+
+The `confidential-chat.ts` library validates all messages:
+- Role must be "system", "user", or "assistant"
+- Content must be a non-empty string
+- System message is automatically prepended if not present
+
+## Provider Configuration
+
+The frontend supports dynamic provider configuration:
+- **Base URL**: `NEXT_PUBLIC_VLLM_BASE_URL` or user-provided
+- **Model**: `NEXT_PUBLIC_VLLM_MODEL` or user-provided
+- **API Key**: Optional Bearer token
+- **System Prompt**: `NEXT_PUBLIC_DEFAULT_SYSTEM_PROMPT` or custom
+- **Temperature**: `NEXT_PUBLIC_DEFAULT_TEMPERATURE` (default: 0.7)
+- **Max Tokens**: `NEXT_PUBLIC_DEFAULT_MAX_TOKENS` (default: 4098)
+
+## Reasoning Support
+
+Some models support reasoning traces. The library handles:
+- `reasoning_content` in message objects
+- Streaming reasoning deltas via `reasoning_delta` chunks
+- Reasoning effort levels ("low", "medium", "high")
+
+## Implementation Details
+
+<Warning>
+**Attestation Requirement**: The frontend library enforces aTLS connections in production. The `fetchImpl` parameter must be provided, typically using `createAtlsFetch` from `@phala/dcap-qvl-web`.
+</Warning>
+
+<Note>
+**OpenAI Compatibility**: This endpoint follows the OpenAI Chat Completions API specification, making it compatible with standard OpenAI client libraries (though you'll need custom aTLS fetch for attestation).
+</Note>
+
+## Error Interpretation
+
+The library provides helpful error messages:
+- **Max tokens**: "This request is larger than the model can process..."
+- **Auth failure**: "Authorization failed. Check the bearer token..."
+- **Network failure**: "Cannot connect to the provider. Please check..."
+- **CORS**: "CORS error: The provider is blocking requests..."
+- **TLS/SSL**: "TLS/SSL certificate error. Please verify..."
+- **Timeout**: "Request timed out. The provider may be overloaded..."
+
+Source: `frontend/lib/confidential-chat.ts`

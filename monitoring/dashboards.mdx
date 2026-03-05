@@ -1,0 +1,325 @@
+---
+title: 'Dashboard Guide'
+description: 'Understanding and customizing Grafana dashboards for vLLM metrics'
+---
+
+## Available Dashboards
+
+The monitoring stack includes three pre-configured dashboards that provide comprehensive visibility into vLLM performance:
+
+<CardGroup cols={3}>
+  <Card title="User Metrics" icon="user-clock">
+    User-facing performance indicators
+  </Card>
+  <Card title="Machine Metrics" icon="server">
+    Hardware resource utilization
+  </Card>
+  <Card title="vLLM Tokens" icon="coins">
+    Token throughput analysis
+  </Card>
+</CardGroup>
+
+## User Metrics Overview
+
+The **User Metrics Overview** dashboard tracks user-facing performance indicators critical for production deployments.
+
+### Key Metrics
+
+#### Time to First Token (TTFT)
+
+Measures the latency between request arrival and the first generated token.
+
+- **Metric**: `vllm:time_to_first_token_seconds`
+- **Importance**: Directly impacts perceived responsiveness
+- **Target**: Lower is better (typically less than 1s for good UX)
+
+#### End-to-End Latency
+
+Total time from request submission to complete response.
+
+- **Metric**: `vllm:e2e_request_latency_seconds`
+- **Includes**: Queue time + processing time + network overhead
+- **Use case**: SLA monitoring and capacity planning
+
+#### Queue Waiting Time
+
+Time requests spend waiting before processing begins.
+
+- **Metric**: `vllm:time_per_output_token_seconds`
+- **Indicator**: High queue times suggest capacity constraints
+- **Action**: Scale up vLLM instances when consistently elevated
+
+#### Running Requests
+
+Number of requests currently being processed.
+
+- **Metric**: `vllm:num_requests_running`
+- **Normal range**: Depends on batch size and throughput
+- **Alert threshold**: Configure based on your vLLM capacity
+
+### Dashboard Panels
+
+The dashboard is organized into logical sections:
+
+1. **Overview**: High-level request rate and latency percentiles
+2. **Latency Breakdown**: TTFT, queue time, and processing time
+3. **Request Queue**: Running vs waiting requests over time
+4. **Throughput**: Requests per second and tokens per second
+
+## Machine Metrics Overview
+
+The **Machine Metrics Overview** dashboard monitors hardware resource utilization inside the TEE.
+
+### Key Metrics
+
+#### GPU Usage
+
+Real-time GPU utilization and memory consumption.
+
+- **GPU Utilization**: `vllm:gpu_cache_usage_perc`
+- **GPU Memory**: `vllm:gpu_memory_usage_bytes`
+- **KV Cache Usage**: `vllm:cache_usage_perc`
+
+<Info>
+  **KV Cache**: The key-value cache stores attention states. High cache usage (>90%) can cause request queuing.
+</Info>
+
+#### CPU Workload
+
+CPU usage for preprocessing and request orchestration.
+
+- **Metric**: `vllm:cpu_usage_percent`
+- **Baseline**: vLLM is GPU-bound; CPU should be less than 50%
+- **High CPU**: May indicate tokenization bottlenecks
+
+#### Request Queue Depth
+
+Number of requests waiting for GPU availability.
+
+- **Running**: `vllm:num_requests_running`
+- **Waiting**: `vllm:num_requests_waiting`
+- **Swapped**: `vllm:num_requests_swapped`
+
+#### Memory Breakdown
+
+Detailed memory allocation across system components.
+
+- **Total GPU Memory**: Available VRAM
+- **Model Weights**: Fixed allocation for model parameters
+- **KV Cache**: Dynamic allocation for attention states
+- **Activation Memory**: Temporary tensors during computation
+
+### Resource Alerts
+
+Consider setting alerts for:
+
+- **GPU Memory >95%**: Risk of OOM errors
+- **KV Cache >90%**: Request queuing likely
+- **Waiting Requests >10**: Capacity saturation
+
+## vLLM Tokens Dashboard
+
+Provides token-level granularity for throughput analysis:
+
+- **Tokens Generated**: Total output tokens over time
+- **Tokens per Second**: Instantaneous generation rate
+- **Token Efficiency**: Tokens per GPU utilization percent
+- **Batch Size Impact**: Correlation between batch size and throughput
+
+## Customizing Dashboards
+
+### Editing Panels
+
+To modify an existing panel:
+
+1. Click the panel title
+2. Select **Edit**
+3. Modify the query, visualization, or thresholds
+4. Click **Apply** to save changes
+
+<Warning>
+  Dashboard changes are ephemeral unless you export and commit them. See the persistence section below.
+</Warning>
+
+### Adding Custom Panels
+
+<Steps>
+  <Step title="Create a new panel">
+    Click **Add panel** in the dashboard toolbar.
+  </Step>
+  
+  <Step title="Write a Prometheus query">
+    Use the query editor to select vLLM metrics (see Prometheus Queries section).
+  </Step>
+  
+  <Step title="Configure visualization">
+    Choose graph type (Time series, Gauge, Stat, etc.) and customize display options.
+  </Step>
+  
+  <Step title="Set thresholds">
+    Define warning and critical levels using absolute values or percentages.
+  </Step>
+</Steps>
+
+### Persisting Changes
+
+Dashboards are provisioned from template files. To persist customizations:
+
+1. **Export the dashboard**:
+   - Dashboard settings > JSON Model
+   - Copy the JSON
+
+2. **Update the template**:
+   - Edit `grafana/provisioning/dashboards/[dashboard_name].json.template`
+   - Paste the JSON, preserving template variables:
+     - `${VLLM_SCRAPE_JOB_NAME}`
+     - `${GRAFANA_DATASOURCE_UID}`
+
+3. **Rebuild the stack**:
+   ```bash
+   make docker-stop
+   make docker-up
+   ```
+
+<Info>
+  Always maintain the template variable placeholders when editing JSON templates, or the configuration injection will fail.
+</Info>
+
+## Prometheus Queries
+
+### Common vLLM Metrics
+
+These metrics are exposed by vLLM and available in Prometheus:
+
+#### Latency Metrics
+
+```promql
+# Average TTFT over last 5 minutes
+rate(vllm:time_to_first_token_seconds_sum[5m]) 
+  / rate(vllm:time_to_first_token_seconds_count[5m])
+
+# 95th percentile end-to-end latency
+histogram_quantile(0.95, 
+  rate(vllm:e2e_request_latency_seconds_bucket[5m])
+)
+
+# Queue waiting time (avg)
+rate(vllm:time_per_output_token_seconds_sum[5m]) 
+  / rate(vllm:time_per_output_token_seconds_count[5m])
+```
+
+#### Throughput Metrics
+
+```promql
+# Requests per second
+rate(vllm:request_success_total[1m])
+
+# Tokens generated per second
+rate(vllm:generation_tokens_total[1m])
+
+# Current running requests
+vllm:num_requests_running
+```
+
+#### Resource Metrics
+
+```promql
+# GPU memory usage (bytes)
+vllm:gpu_memory_usage_bytes
+
+# GPU cache usage (percentage)
+vllm:gpu_cache_usage_perc
+
+# CPU usage
+vllm:cpu_usage_percent
+```
+
+### Query Tips
+
+<Accordion title="Using rate() for counters">
+  Counter metrics (like `vllm:request_success_total`) always increase. Use `rate()` to calculate per-second rates:
+  
+  ```promql
+  rate(vllm:request_success_total[5m])
+  ```
+  
+  The `[5m]` window smooths out spikes.
+</Accordion>
+
+<Accordion title="Histogram quantiles for percentiles">
+  For latency metrics, use `histogram_quantile()` to calculate percentiles:
+  
+  ```promql
+  # P50 (median)
+  histogram_quantile(0.50, rate(vllm:e2e_request_latency_seconds_bucket[5m]))
+  
+  # P99
+  histogram_quantile(0.99, rate(vllm:e2e_request_latency_seconds_bucket[5m]))
+  ```
+</Accordion>
+
+<Accordion title="Filtering by job">
+  If you have multiple vLLM instances, filter by job name:
+  
+  ```promql
+  vllm:num_requests_running{job="production-vllm"}
+  ```
+</Accordion>
+
+## Dashboard Best Practices
+
+### Time Range Selection
+
+- **Real-time monitoring**: Last 5-15 minutes
+- **Incident investigation**: Last 1-6 hours
+- **Capacity planning**: Last 7-30 days
+
+### Refresh Intervals
+
+- **Production monitoring**: 10-30 seconds
+- **Development**: 1 minute
+- **Historical analysis**: Manual refresh
+
+### Alert Thresholds
+
+Set conservative thresholds to avoid alert fatigue:
+
+- **Warning**: 80% of capacity
+- **Critical**: 95% of capacity
+- **Require**: 2-3 consecutive violations before alerting
+
+<Info>
+  Grafana's unified alerting can send notifications to Slack, PagerDuty, email, and other channels.
+</Info>
+
+## Troubleshooting
+
+### No data in panels
+
+1. **Check Prometheus is scraping**:
+   ```bash
+   docker compose logs prometheus | grep "vllm"
+   ```
+
+2. **Verify metrics endpoint**:
+   ```bash
+   curl http://your-vllm:8000/metrics
+   ```
+
+3. **Inspect Prometheus targets**:
+   - Open Prometheus UI (internal network)
+   - Navigate to Status > Targets
+   - Ensure vLLM target is "UP"
+
+### Incorrect metric values
+
+- **Verify time range**: Ensure the dashboard time picker matches your expectations
+- **Check aggregation**: Some queries use `rate()` or `avg()` which can smooth data
+- **Compare with raw metrics**: Query Prometheus directly to verify values
+
+### Dashboard won't save
+
+Provisioned dashboards are read-only. To make changes:
+
+1. Save as a new dashboard (not provisioned)
+2. Or export and update the JSON template (see Persisting Changes)

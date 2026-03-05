@@ -1,0 +1,107 @@
+---
+title: Introduction to Umbra
+description: A production-ready Confidential AI platform that routes sensitive documents into trusted execution environments (TEEs) for secure AI processing
+---
+
+# Introduction to Umbra
+
+Umbra is Concrete Security's **Confidential AI platform**—a production system that routes sensitive documents into trusted execution environments (TEEs) for processing. The platform combines a Next.js frontend, Python backend services running in Confidential Virtual Machines (CVMs) on Phala Cloud, and a comprehensive monitoring stack.
+
+## What is Confidential AI?
+
+Confidential AI ensures that your sensitive data remains private and secure even while being processed by AI models. Unlike traditional cloud AI services, Umbra uses **Intel TDX (Trust Domain Extensions)** to create isolated execution environments where:
+
+- Data is encrypted in memory during processing
+- The hosting provider cannot access your data
+- You can cryptographically verify the integrity of the execution environment
+- AI model processing happens inside hardware-enforced security boundaries
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Remote Attestation TLS" icon="shield-check">
+    Client-side verification of Intel TDX attestation using DCAP (Data Center Attestation Primitives). No server trust required—your browser cryptographically verifies the TEE before sending data.
+  </Card>
+  
+  <Card title="End-to-End Encryption" icon="lock">
+    Secure communication channels using RA-TLS (Remote Attestation TLS) and EKM (Exported Key Material) channel binding with HMAC-SHA256 for TLS security.
+  </Card>
+  
+  <Card title="Hardware-Enforced Security" icon="microchip">
+    Processing runs inside Intel TDX Confidential VMs on Phala Cloud, providing hardware-level isolation that protects against both external attackers and infrastructure providers.
+  </Card>
+  
+  <Card title="Streaming AI Chat" icon="messages">
+    Real-time streaming chat interface with support for document uploads (text and PDFs), reasoning panels, and OpenAI-compatible API proxy for vLLM integration.
+  </Card>
+</CardGroup>
+
+## How It Works
+
+Umbra establishes a **cryptographically verified connection** between your browser and AI models running in a TEE:
+
+<Steps>
+  <Step title="Submit your request">
+    Enter your prompt and upload sensitive documents through the web interface
+  </Step>
+  
+  <Step title="Establish secure connection">
+    Your browser connects to the TEE server using RA-TLS and performs Intel TDX attestation verification locally
+  </Step>
+  
+  <Step title="Verify the environment">
+    The frontend verifies the TDX quote using DCAP QVL (Quote Verification Library) running entirely in your browser via WebAssembly
+  </Step>
+  
+  <Step title="Process in the TEE">
+    Your data is processed by vLLM inside the TEE, with all computation happening in encrypted memory
+  </Step>
+  
+  <Step title="Receive encrypted response">
+    Results stream back over the secure channel, with metrics collected by Prometheus
+  </Step>
+</Steps>
+
+<Note>
+  The attestation verification happens **client-side** in your browser. This means you don't need to trust any server—you cryptographically verify the TEE yourself.
+</Note>
+
+## Architecture Overview
+
+Umbra consists of three main components:
+
+1. **Frontend** - Next.js 16 application with React 19, TypeScript, Tailwind CSS, and shadcn/ui components
+2. **CVM Services** - Python/FastAPI microservices for attestation, authentication, and certificate management
+3. **Monitoring Stack** - Prometheus and Grafana for vLLM metrics and observability
+
+## Security Mechanisms
+
+<CardGroup cols={3}>
+  <Card title="Intel TDX Attestation" icon="certificate">
+    DCAP verification with client-side quote validation
+  </Card>
+  
+  <Card title="EKM Channel Binding" icon="link">
+    RFC 9266 compliant channel binding with HMAC-SHA256
+  </Card>
+  
+  <Card title="Supabase RLS" icon="database">
+    Row-level security for database access control
+  </Card>
+</CardGroup>
+
+<Info>
+  Want to see the technical details? Check out the [Architecture](/architecture) page for a deep dive into the system design and data flow.
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+    Get Umbra running locally in minutes
+  </Card>
+  
+  <Card title="Architecture Deep Dive" icon="sitemap" href="/architecture">
+    Understand the system architecture and security model
+  </Card>
+</CardGroup>

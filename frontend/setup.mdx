@@ -1,0 +1,195 @@
+---
+title: Frontend Setup
+description: Install dependencies, configure Supabase, and run the Umbra frontend locally
+---
+
+This guide walks through setting up the Umbra frontend for local development.
+
+## Prerequisites
+
+<Note>
+  - Node.js 22 or later
+  - pnpm 10.15.1 (pinned in package.json)
+  - Supabase project (for authentication and waitlist)
+</Note>
+
+## Installation
+
+<Steps>
+  <Step title="Install dependencies">
+    Install all required packages using pnpm:
+
+    <CodeGroup>
+      ```bash pnpm
+      pnpm install
+      ```
+
+      ```bash npm
+      npm install
+      ```
+
+      ```bash make
+      make install
+      ```
+    </CodeGroup>
+
+    The Makefile detects whether pnpm is available and falls back to npm if needed. pnpm matches the CI environment.
+  </Step>
+
+  <Step title="Configure environment">
+    Copy the environment template and fill in required variables:
+
+    ```bash
+    cp .env.example .env.local
+    ```
+
+    Generate a strong `FORM_TOKEN_SECRET`:
+
+    ```bash
+    openssl rand -hex 32
+    ```
+
+    <Note>
+      Never commit `.env.local` to version control. It contains sensitive credentials.
+    </Note>
+
+    See [Environment Variables](/frontend/environment-variables) for a complete reference.
+  </Step>
+
+  <Step title="Set up Supabase">
+    1. Create a Supabase project at [supabase.com](https://supabase.com)
+
+    2. Add callback URLs to **Authentication → URL Configuration**:
+       - `http://localhost:3000/auth/callback` (development)
+       - Your production domain callback URL
+
+    3. Record these values in `.env.local`:
+       - `NEXT_PUBLIC_SUPABASE_URL` - Your project URL
+       - `NEXT_PUBLIC_SUPABASE_ANON_KEY` - Public anon key
+       - `SUPABASE_SERVICE_ROLE_KEY` - Service role key (keep server-side only)
+
+    4. Run the SQL schema to create the waitlist table:
+
+       Execute `supabase/schema.sql` in the Supabase SQL editor or via `psql` to create:
+       - `waitlist_requests` table
+       - `waitlist_status` enum
+       - Indexes and RLS policies
+
+    5. Seed at least one admin user:
+
+       ```sql
+       update auth.users
+       set raw_app_meta_data = jsonb_set(
+         coalesce(raw_app_meta_data, '{}'),
+         '{roles}',
+         '["admin"]'::jsonb,
+         true
+       )
+       where email = 'you@example.com';
+       ```
+
+    6. (Optional) Tag beta users with `member` role so they can sign in without consuming guest sessions:
+
+       ```sql
+       update auth.users
+       set raw_app_meta_data = jsonb_set(
+         coalesce(raw_app_meta_data, '{}'),
+         '{roles}',
+         '["member"]'::jsonb,
+         true
+       )
+       where email = 'beta@example.com';
+       ```
+  </Step>
+
+  <Step title="Run local development server">
+    Start the Next.js development server:
+
+    <CodeGroup>
+      ```bash pnpm
+      pnpm dev --hostname 0.0.0.0 --port 3000
+      ```
+
+      ```bash npm
+      npm run dev -- --hostname 0.0.0.0 --port 3000
+      ```
+
+      ```bash make
+      make dev
+      ```
+
+      ```bash make (auto-open browser)
+      make dev-open
+      ```
+    </CodeGroup>
+
+    The app will be available at `http://localhost:3000`.
+
+    `make dev-open` waits for the server to be ready and automatically opens the browser.
+  </Step>
+
+  <Step title="Build for production">
+    Create an optimized production build:
+
+    <CodeGroup>
+      ```bash pnpm
+      pnpm build && pnpm start
+      ```
+
+      ```bash npm
+      npm run build && npm run start
+      ```
+
+      ```bash make
+      make build && make start
+      ```
+    </CodeGroup>
+
+    The production server respects the `PORT` environment variable:
+
+    ```bash
+    make start PORT=4000
+    ```
+  </Step>
+</Steps>
+
+## Useful Commands
+
+| Command | Purpose |
+|---------|--------|
+| `pnpm lint` | Run ESLint with Next.js rules |
+| `pnpm test:unit` | Execute Vitest unit tests |
+| `pnpm test:e2e` | Run Playwright E2E test suite |
+| `make test` | Run full test suite with required env vars |
+| `make clean` | Remove `.next` build output |
+
+See [Testing](/frontend/testing) for detailed test execution instructions.
+
+## Operational Tips
+
+### Reset Workspace State
+
+- **Hero prompt + attachments**: Stored in `sessionStorage` keys `hero-initial-message` and `hero-uploaded-files`
+- **Provider defaults**: Stored in `localStorage` key `confidential-provider-settings-v1`
+- **Provider tokens**: Stored in `sessionStorage` key `confidential-provider-token`
+
+Clear these keys in browser DevTools to reset the workspace.
+
+### Update System Prompt
+
+Edit `lib/system-prompt.ts` or set `NEXT_PUBLIC_DEFAULT_SYSTEM_PROMPT` environment variable to override the Umbra persona.
+
+### Waitlist Status Flow
+
+Statuses defined in `lib/waitlist.ts`:
+
+`requested` → `contacted` → `invited` → `activated` → `archived`
+
+### Theme Customization
+
+Tailwind tokens are centralized in `styles/globals.css`. Use CSS variables instead of hard-coded colors when creating new components.
+
+## Next Steps
+
+- [Environment Variables](/frontend/environment-variables) - Complete reference for all configuration
+- [Testing](/frontend/testing) - Run and write tests

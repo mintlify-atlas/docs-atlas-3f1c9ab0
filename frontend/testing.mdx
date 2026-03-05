@@ -1,0 +1,326 @@
+---
+title: Testing
+description: Run Vitest unit tests and Playwright E2E tests for the Umbra frontend
+---
+
+The Umbra frontend has comprehensive test coverage with Vitest for unit tests and Playwright for end-to-end testing.
+
+## Test Suites
+
+### Unit Tests (Vitest)
+
+Vitest runs unit tests for core utilities under `tests/unit/`.
+
+**Coverage output**: `test-results/unit/coverage`
+
+**Run all unit tests:**
+
+<CodeGroup>
+  ```bash pnpm
+  pnpm test:unit
+  ```
+
+  ```bash npm
+  npm run test:unit
+  ```
+
+  ```bash make
+  make test
+  ```
+</CodeGroup>
+
+**Run specific test file:**
+
+```bash
+pnpm test:unit -- tests/unit/lib/security/form-token.test.ts
+```
+
+**Watch mode during development:**
+
+```bash
+pnpm vitest
+```
+
+### E2E Tests (Playwright)
+
+Playwright tests walk through the landing page and confidential chat flow with mocked provider responses.
+
+**Test file**: `tests/e2e/secure-chat.spec.ts`
+
+**Run E2E tests:**
+
+<CodeGroup>
+  ```bash pnpm
+  pnpm test:e2e
+  ```
+
+  ```bash npm
+  npm run test:e2e
+  ```
+
+  ```bash make
+  make test
+  ```
+</CodeGroup>
+
+**Run in headed mode (see browser):**
+
+```bash
+pnpm test:e2e -- --headed
+```
+
+**Run specific test file:**
+
+```bash
+pnpm test:e2e -- tests/e2e/secure-chat.spec.ts
+```
+
+## Required Environment Variables
+
+### Unit Tests
+
+Unit tests require `FORM_TOKEN_SECRET` to test form token generation and validation:
+
+```bash
+FORM_TOKEN_SECRET=test-secret pnpm test:unit
+```
+
+### E2E Tests
+
+E2E tests require additional variables:
+
+```bash
+NEXT_PUBLIC_ATTESTATION_TEST_MODE=true \
+FORM_TOKEN_SECRET=test-secret \
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key \
+pnpm test:e2e
+```
+
+**Key variables:**
+
+- `NEXT_PUBLIC_ATTESTATION_TEST_MODE=true` - Skips real DCAP verification (attestation verification is mocked)
+- `FORM_TOKEN_SECRET` - Required for form token validation
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` - Required for Supabase client initialization
+
+<Note>
+  The `make test` target automatically sets required env flags for both unit and E2E tests.
+</Note>
+
+## Full Test Suite
+
+Run all tests (unit + E2E) with a single command:
+
+```bash
+make test
+```
+
+This runs:
+1. Vitest unit tests with coverage
+2. Playwright E2E suite with test mode flags
+
+**CI usage:**
+
+```bash
+make test-ci
+```
+
+## Test Configuration
+
+### Vitest Configuration
+
+**Config file**: `vitest.config.ts` (or inline in `package.json`)
+
+**Key settings:**
+- Coverage provider: v8
+- Coverage output: `test-results/unit/coverage`
+- Test environment: Node.js (default)
+
+### Playwright Configuration
+
+**Config file**: `playwright.config.ts`
+
+**Key settings:**
+- Base URL: `http://127.0.0.1:3000`
+- Browsers: Chromium (default)
+- Test directory: `tests/e2e`
+
+**Update Playwright:**
+
+```bash
+pnpm dlx playwright install
+```
+
+## Coverage Reports
+
+Unit test coverage is generated in `test-results/unit/coverage/` with HTML, JSON, and text reports.
+
+**View HTML coverage:**
+
+```bash
+open test-results/unit/coverage/index.html
+```
+
+## Writing Tests
+
+### Unit Test Example
+
+```typescript
+import { describe, it, expect } from 'vitest'
+import { generateFormToken, verifyFormToken } from '@/lib/security/form-token'
+
+describe('form-token', () => {
+  it('generates and verifies valid tokens', () => {
+    const secret = 'test-secret'
+    const token = generateFormToken(secret)
+    
+    expect(token).toBeDefined()
+    expect(verifyFormToken(token, secret)).toBe(true)
+  })
+
+  it('rejects invalid tokens', () => {
+    const secret = 'test-secret'
+    const token = 'invalid-token'
+    
+    expect(verifyFormToken(token, secret)).toBe(false)
+  })
+})
+```
+
+### E2E Test Example
+
+```typescript
+import { test, expect } from '@playwright/test'
+
+test('landing page loads and displays hero', async ({ page }) => {
+  await page.goto('/')
+  
+  // Check hero heading
+  await expect(page.locator('h1')).toContainText('Confidential AI')
+  
+  // Check hero prompt form
+  const promptInput = page.locator('textarea[name="prompt"]')
+  await expect(promptInput).toBeVisible()
+})
+
+test('confidential workspace requires attestation', async ({ page }) => {
+  await page.goto('/confidential-ai')
+  
+  // Verify attestation status indicator
+  const status = page.locator('[data-testid="attestation-status"]')
+  await expect(status).toBeVisible()
+  
+  // Verify message input is disabled until attestation
+  const messageInput = page.locator('textarea[name="message"]')
+  await expect(messageInput).toBeDisabled()
+})
+```
+
+## Debugging Tests
+
+### Vitest Debug
+
+**Run with verbose output:**
+
+```bash
+pnpm test:unit -- --reporter=verbose
+```
+
+**Run single test with only:**
+
+```typescript
+import { describe, it, expect } from 'vitest'
+
+describe.only('form-token', () => {
+  it.only('generates valid tokens', () => {
+    // This test runs in isolation
+  })
+})
+```
+
+### Playwright Debug
+
+**Run in debug mode with inspector:**
+
+```bash
+PWDEBUG=1 pnpm test:e2e
+```
+
+**Take screenshots on failure:**
+
+Configure in `playwright.config.ts`:
+
+```typescript
+use: {
+  screenshot: 'only-on-failure',
+  video: 'retain-on-failure',
+}
+```
+
+**View trace:**
+
+```bash
+pnpm dlx playwright show-report
+```
+
+## Test Best Practices
+
+1. **Isolate tests** - Each test should be independent and not rely on others
+2. **Mock external services** - Use `NEXT_PUBLIC_ATTESTATION_TEST_MODE=true` for E2E tests
+3. **Use data attributes** - Prefer `data-testid` over fragile CSS selectors
+4. **Test user flows** - E2E tests should simulate real user interactions
+5. **Keep unit tests focused** - Test single functions/modules in isolation
+6. **Clean up state** - Reset localStorage/sessionStorage between E2E tests
+7. **Use assertions liberally** - Better to over-assert than miss bugs
+
+## CI Integration
+
+GitHub Actions runs the full test suite on every PR:
+
+```yaml
+- name: Run tests
+  run: make test
+  env:
+    FORM_TOKEN_SECRET: ${{ secrets.FORM_TOKEN_SECRET }}
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+    NEXT_PUBLIC_ATTESTATION_TEST_MODE: true
+```
+
+## Linting
+
+Run ESLint with Next.js rules:
+
+<CodeGroup>
+  ```bash pnpm
+  pnpm lint
+  ```
+
+  ```bash npm
+  npm run lint
+  ```
+
+  ```bash make
+  make lint
+  ```
+</CodeGroup>
+
+**Auto-fix issues:**
+
+```bash
+pnpm lint --fix
+```
+
+## Pre-commit Checklist
+
+Before opening a PR:
+
+1. ✅ Run `pnpm lint` - No ESLint errors
+2. ✅ Run `pnpm test:unit` - All unit tests pass
+3. ✅ Run `pnpm test:e2e` - E2E tests pass with test mode
+4. ✅ Verify coverage - Check `test-results/unit/coverage`
+5. ✅ Add tests for new features - Maintain high coverage
+
+**One command for all checks:**
+
+```bash
+make test && make lint
+```

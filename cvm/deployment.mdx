@@ -1,0 +1,776 @@
+---
+title: Deployment Guide
+description: Deploy Umbra's CVM services to Phala Cloud with Docker and GitHub Actions
+---
+
+## Overview
+
+Umbra's CVM services are deployed to Phala Cloud, which provides Intel TDX confidential computing infrastructure. This guide covers the complete deployment process from local development to production.
+
+## Prerequisites
+
+### Required Tools
+
+- **Docker**: For building and testing container images
+- **Docker Compose**: For local multi-service orchestration
+- **Make**: For running build and test commands
+- **uv**: Python package manager for development
+- **GitHub Account**: For CI/CD via GitHub Actions
+
+### Required Accounts
+
+- **Phala Cloud**: TEE infrastructure provider
+- **GitHub Container Registry**: Docker image storage
+- **Domain Registrar**: For DNS configuration (e.g., Cloudflare)
+
+## Local Development Setup
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/concrete-security/umbra.git
+    cd umbra/cvm
+    ```
+  </Step>
+
+  <Step title="Configure environment variables">
+    Create a `.env` file with development settings:
+
+    ```bash
+    # Development mode settings
+    DEV_MODE=true
+    NO_TDX=true
+    DOMAIN=localhost
+    
+    # Auth service token (generate with: python -c "import secrets; print(secrets.token_urlsafe(32))")
+    AUTH_SERVICE_TOKEN=your-dev-token-min-32-chars
+    
+    # EKM shared secret for development
+    EKM_SHARED_SECRET=dev-secret-key-at-least-32-characters
+    ```
+  </Step>
+
+  <Step title="Start development services">
+    ```bash
+    # Start all services in development mode
+    make dev-up
+    
+    # View logs
+    docker compose -f docker-compose.yml -f docker-compose.dev.override.yml logs -f
+    ```
+    
+    Services will be available at:
+    - **Nginx**: https://localhost (self-signed cert)
+    - **Attestation**: Internal port 8080
+    - **Auth**: Internal port 8081
+    - **vLLM**: Internal port 8000
+  </Step>
+
+  <Step title="Run tests">
+    ```bash
+    # Wait for services to be ready
+    make wait-services
+    
+    # Run full test suite
+    make test-all
+    
+    # Or run specific tests
+    make test-health
+    make test-attestation
+    make test-vllm
+    ```
+  </Step>
+
+  <Step title="Stop services">
+    ```bash
+    make dev-down
+    ```
+  </Step>
+</Steps>
+
+## Building Docker Images
+
+### Service Images
+
+Each service has its own Dockerfile:
+
+```bash
+# Build all images
+docker compose build
+
+# Build specific service
+docker compose build attestation-service
+docker compose build auth-service
+docker compose build nginx-cert-manager
+```
+
+### Attestation Service
+
+```dockerfile
+FROM python:3.11-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY pyproject.toml .
+RUN uv sync --frozen
+
+COPY attestation_service.py .
+
+EXPOSE 8080
+
+CMD ["uv", "run", "fastapi", "run", "attestation_service.py", \
+     "--host", "0.0.0.0", "--port", "8080", "--workers", "8"]
+```
+
+From `attestation-service/Dockerfile`
+
+### Auth Service
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY src/auth_service/ ./auth_service/
+
+EXPOSE 8081
+
+CMD ["python", "-m", "auth_service.main"]
+```
+
+From `auth-service/Dockerfile`
+
+### Certificate Manager
+
+```dockerfile
+FROM nginx:alpine
+
+# Install Python, pip, supervisor
+RUN apk add --no-cache python3 py3-pip supervisor certbot
+
+# Copy nginx with custom EKM module
+COPY nginx-with-ekm /usr/sbin/nginx
+
+# Copy configurations
+COPY nginx_conf/ /etc/nginx/
+COPY supervisord.conf /etc/supervisord.conf
+
+# Install cert-manager Python package
+COPY pyproject.toml .
+COPY src/ ./src/
+RUN pip install .
+
+EXPOSE 80 443
+
+CMD ["supervisord", "-c", "/etc/supervisord.conf"]
+```
+
+From `cert-manager/Dockerfile`
+
+## GitHub Container Registry
+
+<Steps>
+  <Step title="Create GitHub Personal Access Token">
+    1. Go to GitHub Settings → Developer settings → Personal access tokens
+    2. Generate new token (classic)
+    3. Select scopes: `write:packages`, `read:packages`, `delete:packages`
+    4. Save token securely
+  </Step>
+
+  <Step title="Login to GHCR">
+    ```bash
+    echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+    ```
+  </Step>
+
+  <Step title="Tag and push images">
+    ```bash
+    # Tag images
+    docker tag attestation-service ghcr.io/concrete-security/attestation-service:latest
+    docker tag auth-service ghcr.io/concrete-security/auth-service:latest
+    docker tag cert-manager ghcr.io/concrete-security/cert-manager:latest
+    
+    # Push to registry
+    docker push ghcr.io/concrete-security/attestation-service:latest
+    docker push ghcr.io/concrete-security/auth-service:latest
+    docker push ghcr.io/concrete-security/cert-manager:latest
+    ```
+  </Step>
+
+  <Step title="Pin images by digest">
+    For production stability, use SHA256 digests:
+
+    ```bash
+    # Get image digest
+    docker inspect ghcr.io/concrete-security/attestation-service:latest \
+      --format='{{index .RepoDigests 0}}'
+    
+    # Update docker-compose.yml
+    services:
+      attestation-service:
+        image: ghcr.io/concrete-security/attestation-service@sha256:e7f82b46...
+    ```
+  </Step>
+</Steps>
+
+## Phala Cloud Deployment
+
+### Platform Overview
+
+Phala Cloud provides:
+
+- Intel TDX confidential virtual machines
+- dstack daemon for TEE integration
+- Secure key derivation and attestation
+- NVIDIA GPU support for AI workloads
+
+### Deployment Configuration
+
+<Steps>
+  <Step title="Prepare production docker-compose.yml">
+    Ensure production settings:
+
+    ```yaml
+    services:
+      nginx-cert-manager:
+        image: ghcr.io/concrete-security/cert-manager@sha256:...
+        environment:
+          - DOMAIN=vllm.concrete-security.com
+          - DEV_MODE=false
+          - LETSENCRYPT_STAGING=false
+          - LETSENCRYPT_ACCOUNT_VERSION=v1
+        volumes:
+          - tls-certs-keys:/etc/nginx/ssl/
+          - /var/run/dstack.sock:/var/run/dstack.sock
+
+      attestation-service:
+        image: ghcr.io/concrete-security/attestation-service@sha256:...
+        environment:
+          - WORKERS=8
+        volumes:
+          - /var/run/dstack.sock:/var/run/dstack.sock
+
+      auth-service:
+        image: ghcr.io/concrete-security/auth-service@sha256:...
+        environment:
+          - AUTH_SERVICE_TOKEN=${AUTH_SERVICE_TOKEN}
+
+      vllm:
+        image: ghcr.io/concrete-security/vllm-openai@sha256:...
+        runtime: nvidia
+        volumes:
+          - huggingface-cache:/root/.cache/huggingface
+    ```
+  </Step>
+
+  <Step title="Configure DNS">
+    Point your domain to the Phala Cloud instance:
+
+    ```
+    A    vllm.concrete-security.com    →  YOUR_PHALA_IP
+    ```
+
+    Wait for DNS propagation (check with `dig vllm.concrete-security.com`).
+  </Step>
+
+  <Step title="Set environment variables on Phala Cloud">
+    Configure secrets in Phala Cloud dashboard or via CLI:
+
+    ```bash
+    # Generate secure token
+    AUTH_SERVICE_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+    
+    # Set in Phala Cloud
+    phala env set AUTH_SERVICE_TOKEN="$AUTH_SERVICE_TOKEN"
+    ```
+
+    <Warning>
+    Never commit `AUTH_SERVICE_TOKEN` or other secrets to version control. Use secrets management.
+    </Warning>
+  </Step>
+
+  <Step title="Deploy to Phala Cloud">
+    Upload docker-compose.yml to Phala Cloud:
+
+    ```bash
+    # Using Phala CLI (example)
+    phala deploy --compose docker-compose.yml
+    
+    # Or upload via Phala Cloud dashboard
+    ```
+
+    Phala Cloud will:
+    1. Pull Docker images from GHCR
+    2. Create TEE instance with dstack daemon
+    3. Mount `/var/run/dstack.sock` for TEE integration
+    4. Start services with Docker Compose
+  </Step>
+
+  <Step title="Verify deployment">
+    ```bash
+    # Check service health
+    curl https://vllm.concrete-security.com/health
+    
+    # Test attestation endpoint
+    curl -X POST https://vllm.concrete-security.com/tdx_quote \
+      -H "Content-Type: application/json" \
+      -d '{"nonce_hex": "'$(openssl rand -hex 32)'"}'
+    
+    # Verify TLS certificate
+    openssl s_client -connect vllm.concrete-security.com:443 -servername vllm.concrete-security.com
+    ```
+  </Step>
+</Steps>
+
+## GitHub Actions CI/CD
+
+### Workflow Overview
+
+A typical CI/CD workflow for CVM services:
+
+```yaml
+name: Build and Deploy CVM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cvm/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cvm/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build images
+        working-directory: cvm
+        run: docker compose build
+      
+      - name: Start services
+        working-directory: cvm
+        run: make dev-up
+      
+      - name: Wait for services
+        working-directory: cvm
+        run: make wait-services
+      
+      - name: Run tests
+        working-directory: cvm
+        run: DEV=true make test-all
+      
+      - name: Stop services
+        if: always()
+        working-directory: cvm
+        run: make dev-down
+
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push attestation-service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./cvm/attestation-service
+          push: true
+          tags: |
+            ghcr.io/concrete-security/attestation-service:latest
+            ghcr.io/concrete-security/attestation-service:${{ github.sha }}
+      
+      - name: Build and push auth-service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./cvm/auth-service
+          push: true
+          tags: |
+            ghcr.io/concrete-security/auth-service:latest
+            ghcr.io/concrete-security/auth-service:${{ github.sha }}
+      
+      - name: Build and push cert-manager
+        uses: docker/build-push-action@v5
+        with:
+          context: ./cvm/cert-manager
+          push: true
+          tags: |
+            ghcr.io/concrete-security/cert-manager:latest
+            ghcr.io/concrete-security/cert-manager:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to Phala Cloud
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
+        run: |
+          # Update docker-compose.yml with new image digests
+          # Deploy via Phala CLI or API
+          echo "Deploying to Phala Cloud..."
+```
+
+### Secrets Configuration
+
+Configure in GitHub repository settings → Secrets and variables → Actions:
+
+| Secret | Description |
+|--------|-------------|
+| `PHALA_API_KEY` | Phala Cloud API key for deployments |
+| `AUTH_SERVICE_TOKEN` | Production auth token |
+| `GHCR_TOKEN` | GitHub PAT for container registry (if needed) |
+
+## Production Configuration
+
+### Environment Variables
+
+Production environment configuration:
+
+```bash
+# Nginx Certificate Manager
+DOMAIN=vllm.concrete-security.com
+DEV_MODE=false
+LETSENCRYPT_STAGING=false
+LETSENCRYPT_ACCOUNT_VERSION=v1
+EMAIL=certbot@concrete-security.com
+LOG_LEVEL=INFO
+
+# Attestation Service
+HOST=0.0.0.0
+PORT=8080
+WORKERS=8
+# NO_TDX should NOT be set in production
+
+# Auth Service
+HOST=0.0.0.0
+PORT=8081
+AUTH_SERVICE_TOKEN=<generated-secure-token>
+LOG_LEVEL=INFO
+
+# vLLM
+NVIDIA_VISIBLE_DEVICES=all
+```
+
+### Security Checklist
+
+<Steps>
+  <Step title="Secure token generation">
+    Generate cryptographically secure tokens:
+
+    ```bash
+    # Auth service token
+    python -c "import secrets; print(secrets.token_urlsafe(32))"
+    ```
+  </Step>
+
+  <Step title="Disable development modes">
+    Ensure production settings:
+    - `DEV_MODE=false`
+    - `NO_TDX` not set
+    - `LETSENCRYPT_STAGING=false`
+  </Step>
+
+  <Step title="Configure firewall">
+    Only expose required ports:
+    - Port 80: HTTP (ACME challenges only)
+    - Port 443: HTTPS
+    - Block all other ports (8080, 8081, 8000)
+  </Step>
+
+  <Step title="Enable HTTPS">
+    Verify TLS configuration:
+    - Valid Let's Encrypt certificate
+    - TLS 1.3 enforced
+    - HTTP redirects to HTTPS
+  </Step>
+
+  <Step title="Monitor logs">
+    Set up log aggregation for:
+    - Certificate renewal events
+    - Authentication failures
+    - Attestation requests
+    - Service errors
+  </Step>
+</Steps>
+
+## Monitoring and Maintenance
+
+### Health Checks
+
+Implement health check monitoring:
+
+```bash
+# Create health check script
+cat > check-health.sh <<'EOF'
+#!/bin/bash
+set -e
+
+BASE_URL="https://vllm.concrete-security.com"
+
+# Check main health endpoint
+curl -f "$BASE_URL/health" || exit 1
+
+# Check attestation service
+curl -f -X POST "$BASE_URL/tdx_quote" \
+  -H "Content-Type: application/json" \
+  -d '{"nonce_hex": "'$(openssl rand -hex 32)'"}' || exit 1
+
+echo "All health checks passed"
+EOF
+
+chmod +x check-health.sh
+```
+
+### Certificate Monitoring
+
+Monitor certificate expiry:
+
+```bash
+# Check certificate expiry date
+openssl s_client -connect vllm.concrete-security.com:443 \
+  -servername vllm.concrete-security.com 2>/dev/null | \
+  openssl x509 -noout -dates
+
+# Alert if expiring within 7 days
+EXPIRY=$(openssl s_client -connect vllm.concrete-security.com:443 \
+  -servername vllm.concrete-security.com 2>/dev/null | \
+  openssl x509 -noout -enddate | cut -d= -f2)
+
+EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s)
+NOW_EPOCH=$(date +%s)
+DAYS_LEFT=$(( ($EXPIRY_EPOCH - $NOW_EPOCH) / 86400 ))
+
+if [ $DAYS_LEFT -lt 7 ]; then
+  echo "WARNING: Certificate expires in $DAYS_LEFT days"
+fi
+```
+
+### Log Collection
+
+Collect logs from all services:
+
+```bash
+# Via Docker Compose
+docker compose logs --tail=100 -f
+
+# Individual services
+docker logs nginx-cert-manager
+docker logs attestation-service
+docker logs auth-service
+docker logs vllm
+
+# Save logs to file
+docker compose logs --no-color > cvm-logs-$(date +%Y%m%d-%H%M%S).log
+```
+
+## Troubleshooting
+
+### Common Issues
+
+<AccordionGroup>
+  <Accordion title="Services fail to start">
+    **Check**:
+    1. Docker daemon running
+    2. Images pulled successfully
+    3. Ports not already in use
+    4. Environment variables set
+
+    ```bash
+    # Check container status
+    docker compose ps
+    
+    # View container logs
+    docker compose logs
+    
+    # Restart specific service
+    docker compose restart attestation-service
+    ```
+  </Accordion>
+
+  <Accordion title="TLS certificate not generated">
+    **Check**:
+    1. Domain DNS resolves to correct IP
+    2. Port 80 accessible for ACME challenges
+    3. Not hitting Let's Encrypt rate limits
+    4. `/var/run/dstack.sock` mounted correctly
+
+    ```bash
+    # Test ACME challenge accessibility
+    curl http://vllm.concrete-security.com/.well-known/acme-challenge/test
+    
+    # Check cert manager logs
+    docker logs nginx-cert-manager | grep cert-manager
+    
+    # Try staging mode first
+    docker compose stop nginx-cert-manager
+    # Update docker-compose.yml: LETSENCRYPT_STAGING=true
+    docker compose up -d nginx-cert-manager
+    ```
+  </Accordion>
+
+  <Accordion title="Attestation service returns 500 errors">
+    **Check**:
+    1. dstack socket mounted: `/var/run/dstack.sock`
+    2. Running on TDX-enabled hardware
+    3. dstack daemon running in TEE
+
+    ```bash
+    # Check socket mount
+    docker exec attestation-service ls -la /var/run/dstack.sock
+    
+    # Check service logs
+    docker logs attestation-service
+    
+    # Test with development mode (NO_TDX=true) first
+    ```
+  </Accordion>
+
+  <Accordion title="Auth failures on /metrics">
+    **Check**:
+    1. `AUTH_SERVICE_TOKEN` set correctly
+    2. Token at least 32 characters
+    3. Bearer token format: `Authorization: Bearer <token>`
+
+    ```bash
+    # Test auth endpoint directly (internal)
+    docker exec nginx-cert-manager curl -H "Authorization: Bearer $AUTH_SERVICE_TOKEN" http://auth-service:8081/auth
+    
+    # Check auth service logs
+    docker logs auth-service
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Debugging Tools
+
+```bash
+# Enter container shell
+docker exec -it attestation-service /bin/bash
+
+# Check network connectivity
+docker exec nginx-cert-manager ping attestation-service
+
+# View nginx configuration
+docker exec nginx-cert-manager nginx -T
+
+# Test nginx config
+docker exec nginx-cert-manager nginx -t
+
+# View certificate details
+docker exec nginx-cert-manager openssl x509 -in /etc/nginx/ssl/cert.pem -text -noout
+```
+
+## Rollback Procedures
+
+If a deployment fails:
+
+<Steps>
+  <Step title="Identify last working version">
+    ```bash
+    # Check image history
+    docker images ghcr.io/concrete-security/attestation-service
+    ```
+  </Step>
+
+  <Step title="Update docker-compose.yml">
+    Pin to previous working SHA256 digest:
+
+    ```yaml
+    services:
+      attestation-service:
+        image: ghcr.io/concrete-security/attestation-service@sha256:PREVIOUS_DIGEST
+    ```
+  </Step>
+
+  <Step title="Redeploy">
+    ```bash
+    docker compose pull
+    docker compose up -d
+    ```
+  </Step>
+
+  <Step title="Verify rollback">
+    ```bash
+    make test-all
+    ```
+  </Step>
+</Steps>
+
+## Performance Optimization
+
+### vLLM Configuration
+
+Optimize GPU memory and throughput:
+
+```yaml
+vllm:
+  command: >
+    --model openai/gpt-oss-120b
+    --tensor-parallel-size 1
+    --gpu-memory-utilization 0.95
+    --max-model-len 131072
+    --max-num-seqs 8
+    --async-scheduling
+```
+
+### Attestation Service Scaling
+
+Scale for high throughput:
+
+```yaml
+attestation-service:
+  environment:
+    - WORKERS=16  # Increase for more concurrent requests
+  deploy:
+    replicas: 2   # Or use container replication
+```
+
+### Nginx Keepalive
+
+Optimize for attestation + inference flow:
+
+```nginx
+keepalive_timeout 60;      # Allow longer connections
+keepalive_requests 100;    # More requests per connection
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="CVM Overview" icon="book" href="/cvm/overview">
+    Understand the full CVM architecture
+  </Card>
+  <Card title="Attestation Service" icon="shield-check" href="/cvm/attestation-service">
+    Deep dive into TDX attestation
+  </Card>
+  <Card title="Monitoring Setup" icon="chart-line" href="/monitoring/overview">
+    Set up Prometheus and Grafana
+  </Card>
+  <Card title="Frontend Integration" icon="code" href="/frontend/overview">
+    Connect frontend to CVM services
+  </Card>
+</CardGroup>

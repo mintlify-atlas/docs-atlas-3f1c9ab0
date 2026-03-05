@@ -1,0 +1,698 @@
+---
+title: RA-TLS (aTLS)
+description: Remote Attestation TLS architecture, WebSocket proxy flow, and WASM client implementation
+---
+
+## What is RA-TLS?
+
+**Remote Attestation TLS (RA-TLS)**, also called **aTLS** in Umbra, combines TLS encryption with TEE attestation in a single handshake. Instead of relying on traditional X.509 certificates from a Certificate Authority, RA-TLS uses attestation quotes as the trust anchor.
+
+### Traditional TLS vs RA-TLS
+
+```
+Traditional TLS:
+  Client → [Verify CA-signed certificate] → Server
+           Trust = CA signature
+
+RA-TLS (aTLS):
+  Client → [Verify TEE attestation quote] → Server
+           Trust = Hardware-signed attestation
+```
+
+### Key Benefits
+
+✅ **No CA Required**: Trust comes from hardware attestation, not certificate authorities
+
+✅ **Measurement Verification**: Client verifies exact code running in TEE
+
+✅ **Session Binding**: Attestation bound to TLS session via EKM
+
+✅ **Client-Side Verification**: User's browser performs attestation verification locally
+
+## Architecture Overview
+
+Umbra's aTLS implementation consists of three components:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Browser (Client)                                        │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ @concrete-security/atlas-wasm                       │ │
+│ │   ├── TLS 1.3 Client (Rust → WASM)                 │ │
+│ │   ├── DCAP QVL (Intel verification library)        │ │
+│ │   ├── Policy Engine (MRTD/RTMR validation)         │ │
+│ │   └── HTTP Client (fetch-compatible)               │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ lib/atlas-client.ts (TypeScript wrapper)            │ │
+│ │   ├── Policy configuration                          │ │
+│ │   ├── Lazy WASM loading                             │ │
+│ │   └── Connection caching                            │ │
+│ └─────────────────────────────────────────────────────┘ │
+└───────────────────┬─────────────────────────────────────┘
+                    │ WebSocket (wss://)
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│ aTLS Proxy (atlas-rs)                                   │
+│   ├── WebSocket → TCP bridge                            │
+│   ├── Allowlist enforcement (SSRF protection)           │
+│   └── Concurrent connection handling                    │
+└───────────────────┬─────────────────────────────────────┘
+                    │ Raw TCP (TLS 1.3)
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│ TEE Server (Phala Cloud CVM)                            │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Nginx (TLS termination)                             │ │
+│ │   ├── TLS 1.3 Server                                │ │
+│ │   ├── EKM extraction                                 │ │
+│ │   └── Routes to attestation service                 │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Attestation Service (FastAPI)                       │ │
+│ │   ├── Generates TDX quotes                          │ │
+│ │   ├── Includes EKM in report_data                   │ │
+│ │   └── Returns quote + TCB info                      │ │
+│ └─────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+## WebSocket Proxy Flow
+
+### Why WebSocket?
+
+Browsers cannot make raw TCP connections due to security restrictions. The aTLS proxy bridges WebSocket (which browsers support) to raw TCP (which the TEE expects):
+
+```typescript
+// Browser establishes WebSocket connection
+const wsUrl = "wss://proxy.example.com?target=tee.example.com:443"
+const ws = new WebSocket(wsUrl)
+
+// WASM client sends raw TLS bytes over WebSocket
+ws.send(tlsClientHelloBytes)
+
+// Proxy forwards bytes to TEE via TCP
+tcpSocket.write(tlsClientHelloBytes)
+
+// TEE responds with TLS Server Hello
+tcpSocket.on('data', (serverHelloBytes) => {
+  // Proxy sends back over WebSocket
+  ws.send(serverHelloBytes)
+})
+```
+
+### Proxy Configuration
+
+The proxy enforces an allowlist to prevent SSRF attacks:
+
+```bash
+# Start proxy with allowlist
+export RATLS_PROXY_ALLOWLIST="tee1.example.com:443,tee2.example.com:443"
+ratls-proxy --bind 0.0.0.0:8080
+```
+
+<Warning>
+**SSRF Protection**: The proxy MUST enforce an allowlist. Without it, attackers could use the proxy to scan internal networks or attack third-party services.
+</Warning>
+
+### Connection Lifecycle
+
+1. **Client connects to proxy**
+   ```typescript
+   const wsUrl = buildProxyUrl("wss://proxy.example.com", "tee.example.com:443")
+   // Result: "wss://proxy.example.com?target=tee.example.com:443"
+   ```
+
+2. **Proxy validates target**
+   - Check if target is in allowlist
+   - If not allowed, close WebSocket with error
+
+3. **Proxy opens TCP connection**
+   - Connect to `tee.example.com:443`
+   - Start bidirectional forwarding
+
+4. **TLS handshake over WebSocket**
+   - WASM client sends TLS Client Hello
+   - Proxy forwards to TEE
+   - TEE responds with Server Hello + Certificate
+   - Proxy forwards back to client
+
+5. **Attestation request**
+   - Client sends `GET /tdx_quote?nonce=...`
+   - TEE generates quote with `report_data = SHA512(nonce + EKM)`
+   - Client receives and verifies quote
+
+6. **Encrypted communication**
+   - If attestation succeeds, client sends HTTP requests
+   - All traffic encrypted with TLS 1.3
+
+## WASM Client Implementation
+
+### Loading the WASM Module
+
+Umbra uses lazy loading to avoid blocking page load:
+
+```typescript
+let wasmInitPromise: Promise<{ createAtlasFetch: CreateAtlasFetchFn }> | null = null
+
+async function loadWasmModule(): Promise<{ createAtlasFetch: CreateAtlasFetchFn }> {
+  if (typeof window === "undefined") {
+    throw new Error("aTLS WASM can only be used in browser environment")
+  }
+
+  if (wasmInitPromise) {
+    return wasmInitPromise // Return cached promise
+  }
+
+  wasmInitPromise = (async () => {
+    // Package integrity verified by npm/pnpm during installation
+    const mod = await import("@concrete-security/atlas-wasm") as AtlasWasmModule
+    if (!mod.AtlsHttp || typeof mod.AtlsHttp.connect !== "function") {
+      throw new Error("Unsupported @concrete-security/atlas-wasm API shape")
+    }
+    return {
+      createAtlasFetch: createAtlasFetchFromAtlsHttp(mod),
+    }
+  })()
+
+  return wasmInitPromise
+}
+```
+
+### Policy Configuration
+
+The client verifies the TEE meets expected measurements:
+
+```typescript
+export type AtlasPolicy = {
+  type: "dstack_tdx"
+  /** Expected bootchain measurements */
+  expected_bootchain?: {
+    mrtd?: string
+    rtmr0?: string
+    rtmr1?: string
+    rtmr2?: string
+  }
+  /** Expected OS image hash */
+  os_image_hash?: string
+  /** App compose configuration */
+  app_compose?: {
+    docker_compose_file?: string
+    allowed_envs?: string[]
+  }
+  /** Allowed TCB status values (defaults to ["UpToDate"]) */
+  allowed_tcb_status?: string[]
+  /** Skip runtime verification - for development only */
+  disable_runtime_verification?: boolean
+}
+```
+
+**Example Production Policy:**
+
+```typescript
+const policy: AtlasPolicy = {
+  type: "dstack_tdx",
+  expected_bootchain: {
+    // Verify boot measurement
+    rtmr0: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+    // Verify OS image
+    rtmr1: "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c",
+    // Verify docker-compose hash (most important for app security)
+    rtmr2: "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+  },
+  app_compose: {
+    docker_compose_file: `
+version: '3.8'
+services:
+  vllm:
+    image: ghcr.io/concrete-security/vllm:v0.6.3@sha256:abc123...
+  nginx:
+    image: nginx:1.25@sha256:def456...
+  attestation:
+    image: ghcr.io/concrete-security/attestation-service:v1.0.0@sha256:789abc...
+    `,
+    allowed_envs: ["VLLM_MODEL", "VLLM_PORT"], // Only these env vars allowed
+  },
+  allowed_tcb_status: ["UpToDate"], // Reject any non-patched systems
+}
+```
+
+<Note>
+The `app_compose` field verifies the exact container images running in the TEE, including SHA256 digests. This ensures the client knows precisely what code is executing.
+</Note>
+
+### Connection Establishment
+
+The WASM client manages connections with caching:
+
+```typescript
+const atlsHttpConnectionCache = new Map<string, AtlasWasmHttpClient>()
+
+return async (input: RequestInfo | URL, init: RequestInit = {}) => {
+  await ensureWasm() // Initialize WASM runtime
+
+  const cacheKey = `${wsUrl}|${sni}`
+  let http = atlsHttpConnectionCache.get(cacheKey)
+  let attestation: AtlasAttestationResult
+
+  if (http && http.isReady()) {
+    // Reuse existing connection
+    attestation = http.attestation()
+  } else {
+    // Establish new connection
+    if (http) {
+      try { http.close() } catch {}
+      atlsHttpConnectionCache.delete(cacheKey)
+    }
+
+    // Connect and verify attestation
+    http = await atlsHttpClass.connect(wsUrl, sni, policy)
+    atlsHttpConnectionCache.set(cacheKey, http)
+    attestation = http.attestation()
+
+    // Trigger callback with attestation result
+    if (onAttestation) {
+      try {
+        await onAttestation(attestation)
+      } catch (error) {
+        atlsHttpConnectionCache.delete(cacheKey)
+        try { http.close() } catch {}
+        throw error
+      }
+    }
+  }
+
+  // Make HTTP request over aTLS connection
+  const result = await http.fetch(method, path, host, headers, body)
+  return new Response(result.body, { ...result, attestation })
+}
+```
+
+### Attestation Callback
+
+The `onAttestation` callback fires after verification succeeds:
+
+```typescript
+const atlasFetch = await createAtlasClient(
+  {
+    proxyUrl: "wss://proxy.example.com",
+    targetHost: "tee.example.com:443",
+    policy,
+  },
+  async (attestation) => {
+    console.log("Attestation Result:")
+    console.log("  TEE Type:", attestation.teeType) // "TDX"
+    console.log("  TCB Status:", attestation.tcbStatus) // "UpToDate"
+    console.log("  Trusted:", attestation.trusted) // true
+
+    // Update UI to show verified connection
+    setTeeStatus({
+      connected: true,
+      teeType: attestation.teeType,
+      tcbStatus: attestation.tcbStatus,
+    })
+
+    // Log for audit trail
+    await logAttestationSuccess({
+      timestamp: Date.now(),
+      teeType: attestation.teeType,
+      tcbStatus: attestation.tcbStatus,
+    })
+  }
+)
+```
+
+## Connection Verification
+
+Umbra verifies the connection at multiple levels:
+
+### 1. WebSocket Connection
+
+```typescript
+// Client establishes WebSocket
+const wsUrl = buildProxyUrl(proxyUrl, targetHost)
+try {
+  const ws = new WebSocket(wsUrl)
+  await waitForOpen(ws)
+} catch (error) {
+  throw new Error("Failed to connect to aTLS proxy")
+}
+```
+
+### 2. TLS Handshake
+
+```typescript
+// WASM client performs TLS 1.3 handshake
+try {
+  const tlsConn = await rustls.connect(ws, serverName)
+} catch (error) {
+  throw new Error("TLS handshake failed")
+}
+```
+
+### 3. Attestation Quote Fetch
+
+```typescript
+// Request TDX quote from TEE
+const nonce = crypto.getRandomValues(new Uint8Array(32))
+const nonceHex = Array.from(nonce).map(b => b.toString(16).padStart(2, '0')).join('')
+
+const response = await tlsConn.fetch("/tdx_quote", {
+  method: "POST",
+  body: JSON.stringify({ nonce_hex: nonceHex }),
+})
+
+const quoteData = await response.json()
+```
+
+### 4. DCAP Verification
+
+```typescript
+// Verify quote using Intel DCAP
+const dcapResult = await dcapQvl.verifyQuote(quoteData.quote)
+if (!dcapResult.valid) {
+  throw new Error("Quote signature verification failed")
+}
+```
+
+### 5. Measurement Validation
+
+```typescript
+// Extract measurements from quote
+const { mrtd, rtmr0, rtmr1, rtmr2 } = parseQuote(quoteData.quote)
+
+// Verify against policy
+if (policy.expected_bootchain?.rtmr2 && rtmr2 !== policy.expected_bootchain.rtmr2) {
+  throw new Error(`RTMR2 mismatch: expected ${policy.expected_bootchain.rtmr2}, got ${rtmr2}`)
+}
+```
+
+### 6. TCB Status Check
+
+```typescript
+// Verify TCB status is acceptable
+const allowedStatuses = policy.allowed_tcb_status || ["UpToDate"]
+if (!allowedStatuses.includes(quoteData.tcb_info.status)) {
+  throw new Error(`Unacceptable TCB status: ${quoteData.tcb_info.status}`)
+}
+```
+
+### 7. Report Data Verification
+
+```typescript
+// Extract EKM from TLS connection
+const ekm = await tlsConn.exportKeyingMaterial(
+  "EXPORTER-Channel-Binding",
+  new Uint8Array(0),
+  32
+)
+const ekmHex = Array.from(ekm).map(b => b.toString(16).padStart(2, '0')).join('')
+
+// Verify report_data = SHA512(nonce + EKM)
+const expectedReportData = await crypto.subtle.digest(
+  "SHA-512",
+  new Uint8Array([...nonce, ...ekm])
+)
+
+const quoteReportData = parseQuote(quoteData.quote).report_data
+if (!arrayEquals(quoteReportData, expectedReportData)) {
+  throw new Error("Report data mismatch - quote not bound to this TLS session")
+}
+```
+
+<Warning>
+**Critical Security Check**: Steps 6 and 7 are essential. Skipping them allows replay attacks and measurement spoofing.
+</Warning>
+
+## Code Examples from atlas-client.ts
+
+### Creating an aTLS Client
+
+```typescript
+import { createAtlasClient, getPolicy, deriveTargetHost } from "@/lib/atlas-client"
+
+// Get policy from environment variables
+const policy = getPolicy()
+
+// Create fetch-compatible aTLS client
+const atlasFetch = await createAtlasClient(
+  {
+    proxyUrl: process.env.NEXT_PUBLIC_ATLAS_PROXY_URL!,
+    targetHost: deriveTargetHost(providerBaseUrl),
+    policy,
+  },
+  (attestation) => {
+    console.log("Connected to TEE:", attestation)
+  }
+)
+
+// Use like regular fetch
+const response = await atlasFetch("/api/chat/completions", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ messages: [...] }),
+})
+
+// Access attestation result
+console.log("TCB Status:", response.attestation.tcbStatus)
+```
+
+### Pre-warming Connections
+
+Establish the aTLS connection on page load:
+
+```typescript
+import { warmupAtlasConnection } from "@/lib/atlas-client"
+
+// In useEffect on page load
+useEffect(() => {
+  const warmup = async () => {
+    try {
+      const attestation = await warmupAtlasConnection(
+        {
+          proxyUrl: process.env.NEXT_PUBLIC_ATLAS_PROXY_URL!,
+          targetHost: deriveTargetHost(providerBaseUrl),
+          policy: getPolicy(),
+        },
+        (att) => {
+          setTeeStatus({
+            connected: true,
+            teeType: att.teeType,
+            tcbStatus: att.tcbStatus,
+          })
+        }
+      )
+      console.log("Connection pre-warmed:", attestation)
+    } catch (error) {
+      console.error("Warmup failed:", error)
+    }
+  }
+  warmup()
+}, [])
+```
+
+### Parsing Container Images
+
+Extract service information from the policy:
+
+```typescript
+import { parseAppComposeServices, getImageUrl } from "@/lib/atlas-client"
+
+const services = parseAppComposeServices(policy)
+
+services.forEach(service => {
+  console.log(`Service: ${service.name}`)
+  console.log(`  Image: ${service.image}`)
+  console.log(`  Version: ${service.version}`)
+  console.log(`  Digest: ${service.digest}`)
+  console.log(`  URL: ${getImageUrl(service.image, service.digest)}`)
+})
+
+// Output:
+// Service: vllm
+//   Image: ghcr.io/concrete-security/vllm:v0.6.3@sha256:abc123...
+//   Version: v0.6.3
+//   Digest: sha256:abc123...
+//   URL: https://github.com/concrete-security/vllm/pkgs/container/vllm/versions
+```
+
+### Error Categorization
+
+```typescript
+import { categorizeAtlsError } from "@/lib/atlas-client"
+
+try {
+  await atlasFetch("/api/endpoint")
+} catch (error) {
+  const categorized = categorizeAtlsError(error)
+  
+  console.error(`[${categorized.category}] ${categorized.message}`)
+  if (categorized.hint) {
+    console.log(`Hint: ${categorized.hint}`)
+  }
+  if (categorized.details) {
+    console.debug(`Details: ${categorized.details}`)
+  }
+
+  // Handle by category
+  switch (categorized.category) {
+    case "proxy_connection":
+      showError("Unable to reach secure proxy. Check network connection.")
+      break
+    case "attestation_mismatch":
+      showError("Server security verification failed. Do not proceed.")
+      break
+    case "handshake":
+      showError("Secure connection failed. Try again.")
+      break
+    // ...
+  }
+}
+```
+
+## Security Considerations
+
+### Client-Side Verification
+
+<Warning>
+**Critical**: All attestation verification happens in the browser. The client MUST NOT trust the server's word that it's running in a TEE. Always verify the quote locally.
+</Warning>
+
+### Connection Caching
+
+The WASM client caches connections to avoid repeated handshakes:
+
+- **Per-origin**: Each `(proxyUrl, targetHost, serverName)` tuple gets one connection
+- **Automatic cleanup**: Stale connections are closed and removed
+- **Thread-safe**: Cache uses WASM synchronization primitives
+
+### Proxy Security
+
+The WebSocket proxy is a potential attack vector:
+
+✅ **Allowlist enforcement**: Reject connections to non-approved targets
+
+✅ **Rate limiting**: Prevent DoS attacks
+
+✅ **No request inspection**: Proxy sees only encrypted TLS bytes
+
+✅ **Audit logging**: Log all connection attempts
+
+### Browser Limitations
+
+WASM clients have constraints:
+
+- **No raw sockets**: Must use WebSocket proxy
+- **CORS restrictions**: Proxy must set correct CORS headers
+- **Memory limits**: Large policies may hit WASM memory limits
+- **Performance**: WASM is slower than native code (but still fast enough)
+
+## Troubleshooting
+
+### WASM Module Load Failure
+
+```
+Error: Failed to load @concrete-security/atlas-wasm
+```
+
+**Causes:**
+- npm/pnpm installation incomplete
+- WASM not supported in browser (ancient IE, etc.)
+- Content Security Policy blocking WASM
+- CORS issue loading .wasm file
+
+**Solution:**
+```typescript
+// Check WASM support
+if (typeof WebAssembly === "undefined") {
+  showError("Your browser does not support WebAssembly. Please upgrade.")
+}
+```
+
+### Proxy Connection Failed
+
+```
+Error: Failed to connect to aTLS proxy
+```
+
+**Causes:**
+- Proxy URL incorrect
+- Proxy not running
+- Firewall blocking WebSocket
+- Network connectivity issue
+
+**Solution:**
+```bash
+# Test proxy manually
+wscat -c "wss://proxy.example.com"
+```
+
+### Attestation Verification Failed
+
+```
+Error: Attestation verification failed
+```
+
+See [TDX Attestation Troubleshooting](/security/tdx-attestation#troubleshooting) for detailed debugging.
+
+## Performance Optimization
+
+### Connection Warmup
+
+Establish the connection before the user needs it:
+
+```typescript
+// On page load
+await warmupAtlasConnection(config, onAttestation)
+
+// Later, when user sends message
+const response = await atlasFetch("/api/chat", {...})
+// Uses cached connection - no handshake delay
+```
+
+### Parallel Requests
+
+The WASM client supports HTTP/1.1 pipelining:
+
+```typescript
+// These requests share the same aTLS connection
+const [response1, response2] = await Promise.all([
+  atlasFetch("/api/endpoint1"),
+  atlasFetch("/api/endpoint2"),
+])
+```
+
+### Streaming Responses
+
+aTLS supports streaming (Server-Sent Events, chunked encoding):
+
+```typescript
+const response = await atlasFetch("/api/chat/completions", {
+  method: "POST",
+  body: JSON.stringify({ messages: [...], stream: true }),
+})
+
+const reader = response.body!.getReader()
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  processChunk(value)
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="TEE Overview" icon="shield" href="/security/tee-overview">
+    Understand the fundamentals of Trusted Execution Environments
+  </Card>
+  <Card title="TDX Attestation" icon="shield-check" href="/security/tdx-attestation">
+    Deep dive into Intel TDX quote generation and verification
+  </Card>
+  <Card title="EKM Channel Binding" icon="link" href="/security/ekm-channel-binding">
+    Learn how TLS sessions are cryptographically bound
+  </Card>
+  <Card title="Atlas GitHub" icon="github" href="https://github.com/concrete-security/atlas">
+    View the atlas-rs proxy and WASM client source code
+  </Card>
+</CardGroup>

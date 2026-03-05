@@ -1,0 +1,322 @@
+---
+title: "Confidential AI Workspace"
+description: "Secure streaming chat interface with hardware-verified attestation and encrypted file processing"
+---
+
+The Confidential AI workspace provides an end-to-end encrypted environment for processing sensitive documents and prompts through AI models running inside trusted execution environments (TEEs).
+
+## Overview
+
+The workspace is implemented as a Next.js client-side application (`app/confidential-ai/page.tsx`) that establishes cryptographically verified connections to TEE-hosted language models through Attested TLS (aTLS).
+
+<Note>
+  All provider credentials and settings are stored entirely in the browser using localStorage and sessionStorage. No secrets touch the server code.
+</Note>
+
+## Core Features
+
+### Streaming Chat Interface
+
+The workspace provides a real-time streaming chat experience with:
+
+- **OpenAI-compatible API** proxied through `/api/chat/completions`
+- **Server-Sent Events (SSE)** for streaming responses
+- **Reasoning panel** with configurable effort levels (`low`, `medium`, `high`)
+- **Cache salt** for session-based prompt caching
+- **Markdown rendering** with syntax highlighting and copy buttons
+
+<Steps>
+  <Step title="Configure Provider">
+    Set your provider base URL and optional API key in the session dialog. Settings persist in `localStorage` under the key `confidential-provider-settings-v1`.
+  </Step>
+  
+  <Step title="Wait for Attestation">
+    The UI blocks messaging until aTLS connection is established and attestation verification succeeds.
+  </Step>
+  
+  <Step title="Send Messages">
+    Type your prompt and attach files. Messages stream back in real-time with reasoning content displayed in expandable accordions.
+  </Step>
+</Steps>
+
+### File Upload Capabilities
+
+The workspace supports secure file attachments with intelligent processing:
+
+**Supported formats:**
+- Plain text files (`.txt`, `.md`, `.json`, `.csv`, etc.)
+- PDF documents (`.pdf`) with automatic text extraction
+
+**File processing:**
+
+```typescript:frontend/app/confidential-ai/page.tsx
+const extractTextFromPDF = useCallback(async (file: File): Promise<string> => {
+  const pdfModuleUrl = `${window.location.origin}/pdfjs/pdf.mjs`
+  const pdfWorkerUrl = `${window.location.origin}/pdfjs/pdf.worker.mjs`
+  const pdfjsLibModule = await import(/* webpackIgnore: true */ pdfModuleUrl)
+  const pdfjsLib = (pdfjsLibModule as unknown as { default?: any }).default ?? (window as any).pdfjsLib ?? pdfjsLibModule
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+
+  const arrayBuffer = await file.arrayBuffer()
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+  let text = ''
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i)
+    const textContent = await page.getTextContent()
+    const pageText = textContent.items
+      .map((item: any) => ("str" in item ? item.str : ""))
+      .join(' ')
+    text += pageText + '\n'
+  }
+  return text.trim()
+}, [])
+```
+
+**File constraints:**
+- Maximum file size: **100 MB** per file
+- Files are read entirely in the browser before sending
+- PDF text extraction uses `pdf.js` loaded from `/pdfjs/*`
+
+<Warning>
+  Files are appended to message content before dispatch. Large files increase token usage and may exceed model context limits.
+</Warning>
+
+### Provider Settings Management
+
+Provider configuration is managed entirely client-side:
+
+**Storage locations:**
+- `localStorage["confidential-provider-settings-v1"]` - Base URL, model, label
+- `sessionStorage["confidential-provider-token"]` - Bearer tokens (cleared on tab close)
+
+**Environment defaults:**
+
+| Variable | Purpose |
+|----------|--------|
+| `NEXT_PUBLIC_VLLM_BASE_URL` | Default provider base URL |
+| `NEXT_PUBLIC_VLLM_MODEL` | Default model identifier |
+| `NEXT_PUBLIC_VLLM_PROVIDER_NAME` | Friendly provider name |
+
+**Security enforcement:**
+
+The `/api/chat/completions` proxy validates all provider URLs:
+
+```typescript:frontend/lib/confidential-chat.ts
+function normalizeProviderUrl(base: string): string {
+  // Enforce HTTPS or loopback hosts only
+  const url = new URL(base)
+  const isLoopback = isLoopbackHostname(url.hostname)
+  
+  if (url.protocol !== 'https:' && !isLoopback) {
+    throw new Error('Provider URL must use HTTPS or be a loopback address')
+  }
+  
+  return url.toString()
+}
+```
+
+## aTLS Connection Flow
+
+The workspace uses Attested TLS to establish cryptographically verified connections to TEE-hosted models.
+
+### Architecture
+
+<Steps>
+  <Step title="WebSocket Proxy Connection">
+    Browser connects via WebSocket to the aTLS proxy (`NEXT_PUBLIC_ATLS_PROXY_URL`). The proxy bridges WebSocket to TCP, forwarding raw bytes to the TEE.
+  </Step>
+  
+  <Step title="TLS Handshake">
+    WASM client (`lib/atlas-client.ts`) performs TLS 1.3 handshake over the proxied connection.
+  </Step>
+  
+  <Step title="Attestation Verification">
+    Client fetches TDX quote from TEE and verifies attestation using Intel DCAP. On success, the `onAttestation` callback receives `{ trusted, teeType, tcbStatus }`.
+  </Step>
+  
+  <Step title="Secure Channel Established">
+    All subsequent HTTP requests use the attested fetch client, ensuring end-to-end encryption with verified TEE identity.
+  </Step>
+</Steps>
+
+### Connection Implementation
+
+The `connectAtls` function in `page.tsx` manages the connection lifecycle:
+
+```typescript:frontend/app/confidential-ai/page.tsx
+const connectAtls = useCallback(async ({ force = false }: { force?: boolean } = {}) => {
+  const MAX_ATTEMPTS = 3
+  const CONNECTION_TIMEOUT_MS = 30000
+  const RETRY_DELAYS = [1000, 2000, 4000]
+  const RETRYABLE_CATEGORIES: AtlsErrorCategory[] = ["proxy_connection", "timeout", "handshake"]
+
+  // Test mode: auto-verify for E2E testing (non-production builds only)
+  if (ATTESTATION_TEST_MODE) {
+    addAtlsLog("info", "Test mode: simulating attestation...")
+    setAtlsState({ status: "connecting" })
+    await new Promise(resolve => setTimeout(resolve, 500))
+    atlasFetchRef.current = fetch
+    setAtlsState({
+      status: "connected",
+      attestation: { trusted: true, teeType: "TEST_MODE", tcbStatus: "UpToDate" },
+    })
+    return
+  }
+
+  const targetHost = deriveTargetHost(providerApiBase)
+  const policy = getPolicy()
+  const config = { proxyUrl: atlsProxyUrl, targetHost, policy }
+
+  // Attempt connection with retries
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const attestation = await withTimeout(
+        warmupAtlasConnection(config, (att) => {
+          addAtlsLog("info", "Received attestation quote from server")
+          addAtlsLog("info", `TEE Type: ${att.teeType.toUpperCase()}`)
+          addAtlsLog("info", "Verifying Intel TDX quote with DCAP...")
+          addAtlsLog("info", `TCB Status: ${att.tcbStatus}`)
+          if (att.trusted) {
+            addAtlsLog("success", "All attestation checks passed")
+          }
+        }),
+        CONNECTION_TIMEOUT_MS
+      )
+
+      const atlasFetch = await createAtlasClient(config)
+      atlasFetchRef.current = atlasFetch
+      setAtlsState({ status: "connected", attestation })
+      return
+    } catch (error) {
+      const categorized = categorizeAtlsError(error)
+      const isRetryable = RETRYABLE_CATEGORIES.includes(categorized.category)
+      if (isRetryable && attempt < MAX_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]))
+        continue
+      }
+      setAtlsState({ status: "error", error: categorized.message, category: categorized.category })
+      break
+    }
+  }
+}, [atlsProxyUrl, providerApiBase, addAtlsLog])
+```
+
+### Security Properties
+
+<CardGroup cols={2}>
+  <Card title="Hardware-Verified Identity" icon="shield-check">
+    TDX attestation proves the exact code running in the secure enclave through cryptographic measurements (MRTD, RTMR0-2).
+  </Card>
+  
+  <Card title="Intel DCAP Verification" icon="certificate">
+    Attestation quotes are verified using Intel's Data Center Attestation Primitives library, running entirely in-browser via WASM.
+  </Card>
+  
+  <Card title="TLS Channel Binding" icon="link">
+    Attestation is bound to the TLS session using Exported Keying Material (EKM), preventing man-in-the-middle attacks.
+  </Card>
+  
+  <Card title="Zero Server Trust" icon="lock">
+    Provider credentials and attestation verification happen entirely in the browser. The Next.js server never sees secrets.
+  </Card>
+</CardGroup>
+
+## Reasoning Streams and Cache Salts
+
+### Reasoning Content
+
+The workspace supports OpenAI-compatible reasoning streams:
+
+```typescript:frontend/app/confidential-ai/page.tsx
+type Message = {
+  role: "user" | "assistant"
+  content: string
+  attachments?: UploadedFile[]
+  reasoning_content?: string  // Reasoning stream content
+  streaming?: boolean
+  finishReason?: string
+  reasoningStartTime?: number
+  reasoningEndTime?: number
+}
+```
+
+Reasoning content is displayed in expandable accordions with timing information. Users can configure `reasoning_effort` to control the depth of reasoning (`low`, `medium`, `high`).
+
+### Cache Salts
+
+Cache salts enable session-based prompt caching:
+
+```typescript:frontend/app/confidential-ai/page.tsx
+useEffect(() => {
+  const CACHE_SALT_KEY = "confidential-ai-cache-salt"
+  let salt = localStorage.getItem(CACHE_SALT_KEY)
+  if (!salt) {
+    salt = generateUUID()
+    localStorage.setItem(CACHE_SALT_KEY, salt)
+  }
+  setCacheSalt(salt)
+}, [])
+```
+
+The salt is included in system prompts to enable model-side caching of conversation context while maintaining session isolation.
+
+## Guest Throttling
+
+Optional guest throttling limits anonymous usage:
+
+**Configuration:**
+```bash
+NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS=true
+```
+
+**Behavior:**
+- Anonymous visitors get **one confidential session** before sign-in is required
+- Session state tracked via `localStorage["confidential-chat-guest-used"]`
+- Active sessions tracked via `sessionStorage["confidential-chat-guest-active"]`
+- Authenticated users bypass all restrictions
+
+<Note>
+  Guest throttling requires Supabase integration. If Supabase is unavailable, guests have unlimited access.
+</Note>
+
+## Configuration Reference
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_VLLM_BASE_URL` | Optional | Default provider base URL |
+| `NEXT_PUBLIC_VLLM_MODEL` | Optional | Default model identifier |
+| `NEXT_PUBLIC_VLLM_PROVIDER_NAME` | Optional | Friendly provider name |
+| `NEXT_PUBLIC_ATLS_PROXY_URL` | Yes | WebSocket proxy URL (e.g., `wss://proxy.example.com`) |
+| `NEXT_PUBLIC_ATTESTATION_TEST_MODE` | No | Skip real attestation (dev/test only) |
+| `NEXT_PUBLIC_CONFIDENTIAL_ENABLE_GUEST_LIMITS` | No | Enable guest session throttling |
+| `NEXT_PUBLIC_DEFAULT_SYSTEM_PROMPT` | Optional | Override default system prompt |
+| `NEXT_PUBLIC_DEFAULT_MAX_TOKENS` | Optional | Default `max_tokens` (default: 4098) |
+| `NEXT_PUBLIC_DEFAULT_TEMPERATURE` | Optional | Default `temperature` (default: 0.7) |
+
+### Storage Keys
+
+| Key | Storage | Contents |
+|-----|---------|----------|
+| `confidential-provider-settings-v1` | localStorage | Provider base URL, model, label |
+| `confidential-provider-token` | sessionStorage | Bearer tokens |
+| `confidential-ai-cache-salt` | localStorage | UUID for prompt caching |
+| `confidential-chat-guest-used` | localStorage | Guest usage flag |
+| `confidential-chat-guest-active` | sessionStorage | Active guest session flag |
+| `hero-initial-message` | sessionStorage | Landing page prompt handoff |
+| `hero-uploaded-files` | sessionStorage | Landing page file handoff |
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Attestation System" href="/features/attestation" icon="shield-check">
+    Learn about TDX attestation and DCAP verification
+  </Card>
+  
+  <Card title="Authentication" href="/features/authentication" icon="key">
+    Understand Supabase integration and access control
+  </Card>
+</CardGroup>
