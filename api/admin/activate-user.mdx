@@ -1,0 +1,119 @@
+---
+title: "POST /api/admin/waitlist/[id]/activate"
+description: "Generate magic link and send activation email to waitlist user"
+---
+
+## Endpoint
+
+```
+POST /api/admin/waitlist/[id]/activate
+```
+
+Activates a waitlist user by generating a Supabase magic link and sending an activation email. This grants them access to the platform.
+
+## Authentication
+
+Requires a valid Supabase session with the `admin` role in user metadata.
+
+## Path Parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the waitlist request to activate
+</ParamField>
+
+## Request Body
+
+No request body required.
+
+## Response
+
+<ResponseField name="success" type="boolean">
+  Always `true` on successful activation
+</ResponseField>
+
+<ResponseField name="waitlist_id" type="string">
+  The UUID of the activated waitlist request
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The email address that received the activation link
+</ResponseField>
+
+## Error Responses
+
+- **400 Bad Request**: Missing waitlist ID
+- **401 Unauthorized**: Not authenticated
+- **403 Forbidden**: Not an admin user or cross-origin request
+- **404 Not Found**: Waitlist entry not found
+- **500 Internal Server Error**: Failed to generate magic link, send email, or update database
+
+## Example Request
+
+```bash
+curl -X POST "https://your-domain.com/api/admin/waitlist/550e8400-e29b-41d4-a716-446655440000/activate" \
+  -H "Cookie: sb-access-token=..." \
+  -H "Origin: https://your-domain.com"
+```
+
+## Example Response
+
+```json
+{
+  "success": true,
+  "waitlist_id": "550e8400-e29b-41d4-a716-446655440000",
+  "email": "user@example.com"
+}
+```
+
+## Activation Flow
+
+The endpoint performs these operations:
+
+1. **Fetch waitlist request** using service role client
+2. **Generate Supabase magic link** with embedded metadata:
+   - Sets `app_metadata.roles = ["member"]`
+   - Sets `app_metadata.invited_from_waitlist = true`
+   - Sets `app_metadata.waitlist_request_id = <id>`
+3. **Send activation email** via Resend with:
+   - HTML template with branding
+   - Plain text fallback
+   - Magic link for one-click sign-in
+4. **Update waitlist status** to `activated`
+
+## User Metadata
+
+When users sign in via the magic link, their Supabase user profile is automatically populated with:
+
+```typescript
+{
+  app_metadata: {
+    roles: ["member"],
+    invited_from_waitlist: true,
+    waitlist_request_id: "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
+This grants them:
+- Access to protected routes (via `member` role)
+- Bypass of guest throttling
+- Audit trail linking to original waitlist request
+
+## Email Configuration
+
+Requires these environment variables:
+- `RESEND_API_KEY` - Resend API key for sending emails
+- `RESEND_FROM_EMAIL` (optional) - Custom sender email
+
+The email template is defined in `lib/email/templates/waitlist-activation.ts`.
+
+## Security
+
+- **Same-origin enforcement**: Requests must come from the same origin
+- **Admin role required**: Uses `requireAdminUser()` helper
+- **Service role client**: Required for magic link generation and metadata setting
+- **Idempotent**: Can be called multiple times (sends a new activation email each time)
+
+## Source
+
+Implementation: [`frontend/app/api/admin/waitlist/[id]/activate/route.ts`](https://github.com/concrete-security/umbra/blob/main/frontend/app/api/admin/waitlist/%5Bid%5D/activate/route.ts)

@@ -9,8 +9,8 @@
   },
   "favicon": "/favicon.svg",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "/logo/logo.png",
+    "dark": "/logo/logo.png"
   },
   "navbar": {
     "primary": {
@@ -99,7 +99,16 @@
               "api/frontend/waitlist",
               "api/frontend/feedback",
               "api/frontend/form-token",
-              "api/frontend/chat-completions"
+              "api/frontend/chat-completions",
+              "api/frontend/example-docs"
+            ]
+          },
+          {
+            "group": "Admin API Routes",
+            "pages": [
+              "api/admin/list-waitlist",
+              "api/admin/update-waitlist",
+              "api/admin/activate-user"
             ]
           }
         ]

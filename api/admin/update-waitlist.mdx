@@ -1,0 +1,116 @@
+---
+title: "PATCH /api/admin/waitlist/[id]"
+description: "Update a waitlist request's status, notes, or priority"
+---
+
+## Endpoint
+
+```
+PATCH /api/admin/waitlist/[id]
+```
+
+Updates fields on an existing waitlist request. Requires admin authentication.
+
+## Authentication
+
+Requires a valid Supabase session with the `admin` role in user metadata.
+
+## Path Parameters
+
+<ParamField path="id" type="string" required>
+  UUID of the waitlist request to update
+</ParamField>
+
+## Request Body
+
+All fields are optional. At least one field must be provided.
+
+<ParamField body="status" type="string" optional>
+  New status value. Must be one of:
+  - `requested`
+  - `contacted`
+  - `invited`
+  - `activated`
+  - `archived`
+</ParamField>
+
+<ParamField body="notes" type="string" optional>
+  Admin notes about this request. Maximum 2000 characters. Pass `null` or empty string to clear notes.
+</ParamField>
+
+<ParamField body="priority" type="number" optional>
+  Priority level from 0 to 10 (higher = more urgent). Pass `null` or empty string to clear priority.
+</ParamField>
+
+<ParamField body="mark_contacted" type="boolean" optional>
+  If `true`, sets `last_contacted_at` to the current timestamp
+</ParamField>
+
+## Response
+
+<ResponseField name="request" type="object">
+  The updated waitlist request object with all fields
+  
+  See the [List Waitlist](/api/admin/list-waitlist) endpoint for the full object schema.
+</ResponseField>
+
+## Error Responses
+
+- **400 Bad Request**: No updates provided, invalid status, or invalid request ID
+- **401 Unauthorized**: Not authenticated
+- **403 Forbidden**: Not an admin user or cross-origin request
+- **404 Not Found**: Waitlist entry not found
+- **415 Unsupported Media Type**: Content-Type is not application/json
+- **500 Internal Server Error**: Database update failed
+
+## Example Request
+
+```bash
+curl -X PATCH "https://your-domain.com/api/admin/waitlist/550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -H "Cookie: sb-access-token=..." \
+  -H "Origin: https://your-domain.com" \
+  -d '{
+    "status": "contacted",
+    "notes": "Sent intro email with onboarding instructions",
+    "priority": 8,
+    "mark_contacted": true
+  }'
+```
+
+## Example Response
+
+```json
+{
+  "request": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "user@example.com",
+    "name": "Jane Doe",
+    "company": "Acme Corp",
+    "use_case": "Processing medical records",
+    "status": "contacted",
+    "notes": "Sent intro email with onboarding instructions",
+    "priority": 8,
+    "last_contacted_at": "2024-03-05T14:22:00Z",
+    "created_at": "2024-03-05T10:30:00Z",
+    "updated_at": "2024-03-05T14:22:00Z"
+  }
+}
+```
+
+## Validation Rules
+
+- **status**: Must be a valid waitlist status string
+- **notes**: Trimmed and limited to 2000 characters. Empty strings become `null`.
+- **priority**: Rounded to integer, clamped to range 0-10. Empty strings or `null` clear the priority.
+
+## Security
+
+- **Same-origin enforcement**: Requests must come from the same origin
+- **Admin role required**: Uses `requireAdminUser()` helper
+- **JSON validation**: Content-Type must be application/json
+- **Service role client**: Bypasses RLS for database access
+
+## Source
+
+Implementation: [`frontend/app/api/admin/waitlist/[id]/route.ts`](https://github.com/concrete-security/umbra/blob/main/frontend/app/api/admin/waitlist/%5Bid%5D/route.ts)

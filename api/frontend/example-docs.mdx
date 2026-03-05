@@ -1,0 +1,88 @@
+---
+title: "GET /api/example-docs/[id]"
+description: "Retrieve example PDF documents for demonstration purposes"
+---
+
+## Endpoint
+
+```
+GET /api/example-docs/[id]
+```
+
+Retrieves pre-configured example PDF documents for demonstration in the confidential workspace. Returns base64-encoded PDF files that users can load into the chat interface.
+
+## Authentication
+
+No authentication required. This is a public endpoint for demo purposes.
+
+## Path Parameters
+
+<ParamField path="id" type="string" required>
+  The theme ID for the example documents. Available themes are defined in `lib/example-themes.ts`.
+  
+  Example: `medical-report`
+</ParamField>
+
+## Response
+
+<ResponseField name="files" type="array">
+  Array of example document files
+  
+  <Expandable title="file object">
+    <ResponseField name="name" type="string">
+      The filename (e.g., "example.pdf")
+    </ResponseField>
+    
+    <ResponseField name="type" type="string">
+      MIME type, always "application/pdf"
+    </ResponseField>
+    
+    <ResponseField name="data" type="string">
+      Base64-encoded PDF content
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Error Responses
+
+<ResponseField name="error" type="string">
+  Error message explaining what went wrong
+</ResponseField>
+
+- **404 Not Found**: Unknown theme ID or no PDFs found for the theme
+- **500 Internal Server Error**: Failed to read example files from disk
+
+## Example Request
+
+```bash
+curl https://your-domain.com/api/example-docs/medical-report
+```
+
+## Example Response
+
+```json
+{
+  "files": [
+    {
+      "name": "patient-report.pdf",
+      "type": "application/pdf",
+      "data": "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovU..."
+    }
+  ]
+}
+```
+
+## Implementation Details
+
+The endpoint:
+1. Validates the theme ID against configured themes
+2. Resolves the theme directory (checking multiple possible paths)
+3. Scans for `.pdf` files in the theme directory
+4. Reads each PDF and encodes it as base64
+5. Returns all files in a JSON response
+
+Example themes are stored in `frontend/examples_docs/[theme-dir]/` and are used to demonstrate the platform's document processing capabilities without requiring users to upload their own sensitive files.
+
+## Source
+
+Implementation: [`frontend/app/api/example-docs/[id]/route.ts`](https://github.com/concrete-security/umbra/blob/main/frontend/app/api/example-docs/%5Bid%5D/route.ts)
